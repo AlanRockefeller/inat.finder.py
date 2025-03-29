@@ -38,7 +38,18 @@ from tqdm import tqdm
 from datetime import timedelta
 
 def parse_arguments():
-    """Parse command line arguments."""
+    """
+    Parses command-line arguments for the iNaturalist observation finder.
+    
+    This function sets up an argument parser to accept a required genus name and a 
+    potentially mistyped observation number (or URL). It also supports options to specify 
+    the number of digits that might be incorrect (default: 1), enable verbose output, and 
+    disable the progress bar. If no arguments are provided, the help message is printed and 
+    the program exits.
+    
+    Returns:
+        argparse.Namespace: An object with attributes corresponding to the parsed arguments.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("genus", help="The genus name to match (e.g., 'Amanita')")
     parser.add_argument("observation_number", help="The potentially mistyped iNaturalist observation number or URL")
@@ -58,14 +69,19 @@ def parse_arguments():
 
 def generate_digit_variations(number_str, digits_off=1):
     """
-    Generate all possible variations of the number with specified number of digits changed.
-
+    Generate variations of an observation number by altering specified digits.
+    
+    This function produces unique variations of the input observation number by replacing a given
+    number of digits. For a single-digit change, it iterates over each digit position and substitutes
+    it with every other possible digit. For multiple-digit changes, it recursively generates all combinations.
+    If the 'digits_off' parameter is non-positive, the function returns the original number.
+     
     Args:
-        number_str: The original observation number as a string
-        digits: How many digits might be wrong (1 means one digit is wrong)
-
+        number_str (str): The original observation number.
+        digits_off (int, optional): The number of digits to change. Defaults to 1.
+     
     Returns:
-        List of all possible variations
+        List[str]: A list of unique observation number variations.
     """
     if digits_off <= 0:
         return [number_str]  # No variations if digits_off is 0 or negative
@@ -102,15 +118,17 @@ def generate_digit_variations(number_str, digits_off=1):
 
 def generate_digit_additions(number_str, max_added_digits=2):
     """
-    Generate variations by adding up to max_added_digits at the beginning and end.
-    Also handles combinations of adding to both beginning and end simultaneously.
+    Generate observation number variations by appending leading and/or trailing digits.
+    
+    This function returns all combinations where digit sequences (of length 1 up to max_added_digits)
+    are added as a prefix, a suffix, or both to the original number string.
     
     Args:
-        number_str: The original observation number as a string
-        max_added_digits: Maximum number of digits to add (1 or 2)
-        
+        number_str: The original observation number as a string.
+        max_added_digits: Maximum number of digits to add (default is 2).
+    
     Returns:
-        List of all possible variations with added digits
+        A list of strings containing all generated variations.
     """
     variations = []
     
@@ -135,13 +153,19 @@ def generate_digit_additions(number_str, max_added_digits=2):
 
 def parse_inat_url(url_or_number):
     """
-    Extract the observation number from an iNaturalist URL or return the number if it's already a number.
+    Extracts the observation number from an iNaturalist URL.
+    
+    If the input is a URL containing an observation number in the expected format,
+    the function extracts and returns that observation number as a string.
+    If the input does not match the URL pattern or is already an observation number,
+    the original string is returned unchanged.
     
     Args:
-        url_or_number: Either an iNaturalist URL or an observation number
-        
+        url_or_number: A string representing either an iNaturalist URL or an observation number.
+    
     Returns:
-        The extracted observation number as a string
+        A string containing the extracted observation number, or the original input if no valid
+        observation number is found.
     """
     import re
     
@@ -159,7 +183,18 @@ def parse_inat_url(url_or_number):
         return url_or_number
 
 def batch_check_observations(variations, batch_size=30):
-    """Check multiple observation IDs in batches to minimize API calls."""
+    """
+    Check multiple observation IDs by querying the iNaturalist API in batches.
+    
+    This function divides the provided observation ID variations into smaller batches to limit the number of API calls. For each batch, it concatenates the IDs into a comma-separated string and sends a GET request to the iNaturalist observations endpoint. The JSON response is parsed to extract observation details, which are aggregated into a list. If a network error occurs during a batch request, an error message is printed and processing continues with the next batch. A one-second delay is applied after each API call to comply with rate limiting.
+    
+    Args:
+        variations: A list of observation ID strings to be verified.
+        batch_size: Maximum number of observation IDs to include in each API request (default is 30).
+    
+    Returns:
+        A list of observation data dictionaries obtained from the API responses.
+    """
     all_results = []
 
     # Process in batches
@@ -186,7 +221,21 @@ def batch_check_observations(variations, batch_size=30):
     return all_results
 
 def check_observation_genus(observation, target_genus):
-    """Check if an observation has the target genus."""
+    """
+    Determine if an observation belongs to the specified genus.
+    
+    This function inspects the taxonomic data within an observation to verify whether
+    its taxon or any of its ancestors is classified as the given genus. It performs a
+    case-insensitive match by comparing the target genus against the 'name' field of
+    the genus-level taxon or the first part of a multi-word taxon name.
+    
+    Args:
+        observation: A dictionary containing observation details with taxonomic information.
+        target_genus: The genus name to match (case-insensitive).
+    
+    Returns:
+        True if the observation's taxonomy includes the target genus; otherwise, False.
+    """
     if observation and 'taxon' in observation:
         taxon = observation['taxon']
         if taxon and 'ancestry' in taxon:
@@ -207,6 +256,19 @@ def check_observation_genus(observation, target_genus):
     return False
 
 def main():
+    """
+    Executes the iNaturalist observation finder process.
+    
+    This function orchestrates the search for valid iNaturalist observations by:
+    - Parsing command-line arguments and extracting an observation number from a URL or plain input.
+    - Validating the observation number and warning the user if it appears too short (suggesting a possible Mushroom Observer observation).
+    - Optionally confirming whether the original observation number already matches the target genus.
+    - Generating possible variations by altering digits and appending additional ones for shorter numbers.
+    - Checking these variations in batches via API calls and displaying progress.
+    - Presenting a summary of potential matches and the overall search duration.
+    
+    Note: This function interacts with the user via input prompts and exits if critical validation fails.
+    """
     args = parse_arguments()
 
     genus = args.genus
