@@ -2,7 +2,8 @@
 """
 iNaturalist Observation Finder
 
-Version 1.2 - By Alan Rockefeller - March 29, 2025
+Version 1.3 - By Alan Rockefeller - March 29, 2025
+(Optimized version with improved batch processing)
 
 This script helps find the correct iNaturalist observation number when there are mistyped digits.
 It works by systematically changing digits of the provided observation number and checking if
@@ -42,21 +43,21 @@ def parse_arguments():
     """Parse command line arguments."""
     # Create a formatted description from the module docstring
     description = textwrap.dedent(__doc__)
-    
+
     parser = argparse.ArgumentParser(
         description=description,
         formatter_class=argparse.RawDescriptionHelpFormatter  # Use this to preserve formatting
     )
-    
+
     """
     Parses command-line arguments for the iNaturalist observation finder.
-    
-    This function sets up an argument parser to accept a required genus name and a 
-    potentially mistyped observation number (or URL). It also supports options to specify 
-    the number of digits that might be incorrect (default: 1), enable verbose output, and 
-    disable the progress bar. If no arguments are provided, the help message is printed and 
+
+    This function sets up an argument parser to accept a required genus name and a
+    potentially mistyped observation number (or URL). It also supports options to specify
+    the number of digits that might be incorrect (default: 1), enable verbose output, and
+    disable the progress bar. If no arguments are provided, the help message is printed and
     the program exits.
-    
+
     Returns:
         argparse.Namespace: An object with attributes corresponding to the parsed arguments.
     """
@@ -79,16 +80,16 @@ def parse_arguments():
 def generate_digit_variations(number_str, digits_off=1):
     """
     Generate variations of an observation number by altering specified digits.
-    
+
     This function produces unique variations of the input observation number by replacing a given
     number of digits. For a single-digit change, it iterates over each digit position and substitutes
     it with every other possible digit. For multiple-digit changes, it recursively generates all combinations.
     If the 'digits_off' parameter is non-positive, the function returns the original number.
-     
+
     Args:
         number_str (str): The original observation number.
         digits_off (int, optional): The number of digits to change. Defaults to 1.
-     
+
     Returns:
         List[str]: A list of unique observation number variations.
     """
@@ -128,14 +129,14 @@ def generate_digit_variations(number_str, digits_off=1):
 def generate_digit_additions(number_str, max_added_digits=2):
     """
     Generate observation number variations by appending leading and/or trailing digits.
-    
+
     This function returns all combinations where digit sequences (of length 1 up to max_added_digits)
     are added as a prefix, a suffix, or both to the original number string.
-    
+
     Args:
         number_str: The original observation number as a string.
         max_added_digits: Maximum number of digits to add (default is 2).
-    
+
     Returns:
         A list of strings containing all generated variations.
     """
@@ -144,42 +145,42 @@ def generate_digit_additions(number_str, max_added_digits=2):
     # Add single digits at the beginning only (0-9)
     for digit in range(10):
         variations.append(str(digit) + number_str)
-        
+
     # Add single digits at the end only (0-9)
     for digit in range(10):
         variations.append(number_str + str(digit))
-        
+
     # If max_added_digits is 2, add two digits
     if max_added_digits >= 2:
         # Add two digits at the beginning only
         for first_digit in range(10):
             for second_digit in range(10):
                 variations.append(str(first_digit) + str(second_digit) + number_str)
-                
+
         # Add two digits at the end only
         for first_digit in range(10):
             for second_digit in range(10):
                 variations.append(number_str + str(first_digit) + str(second_digit))
-                
+
         # Add one digit at beginning and one at end
         for prefix in range(10):
             for suffix in range(10):
                 variations.append(str(prefix) + number_str + str(suffix))
-    
+
     return variations
 
 def parse_inat_url(url_or_number):
     """
     Extracts the observation number from an iNaturalist URL.
-    
+
     If the input is a URL containing an observation number in the expected format,
     the function extracts and returns that observation number as a string.
     If the input does not match the URL pattern or is already an observation number,
     the original string is returned unchanged.
-    
+
     Args:
         url_or_number: A string representing either an iNaturalist URL or an observation number.
-    
+
     Returns:
         A string containing the extracted observation number, or the original input if no valid
         observation number is found.
@@ -199,16 +200,20 @@ def parse_inat_url(url_or_number):
         # If it's not a URL, assume it's already an observation number
         return url_or_number
 
-def batch_check_observations(variations, batch_size=30):
+def batch_check_observations(variations, batch_size=200):
     """
     Check multiple observation IDs by querying the iNaturalist API in batches.
-    
-    This function divides the provided observation ID variations into smaller batches to limit the number of API calls. For each batch, it concatenates the IDs into a comma-separated string and sends a GET request to the iNaturalist observations endpoint. The JSON response is parsed to extract observation details, which are aggregated into a list. If a network error occurs during a batch request, an error message is printed and processing continues with the next batch. A one-second delay is applied after each API call to comply with rate limiting.
-    
+
+    This function divides the provided observation ID variations into smaller batches to limit the number of API calls. 
+    For each batch, it concatenates the IDs into a comma-separated string and sends a GET request to the iNaturalist 
+    observations endpoint. The JSON response is parsed to extract observation details, which are aggregated into a list. 
+    If a network error occurs during a batch request, an error message is printed and processing continues with the next batch. 
+    A one-second delay is applied after each API call to comply with rate limiting.
+
     Args:
         variations: A list of observation ID strings to be verified.
-        batch_size: Maximum number of observation IDs to include in each API request (default is 30).
-    
+        batch_size: Maximum number of observation IDs to include in each API request (default is 200).
+
     Returns:
         A list of observation data dictionaries obtained from the API responses.
     """
@@ -240,16 +245,16 @@ def batch_check_observations(variations, batch_size=30):
 def check_observation_genus(observation, target_genus):
     """
     Determine if an observation belongs to the specified genus.
-    
+
     This function inspects the taxonomic data within an observation to verify whether
     its taxon or any of its ancestors is classified as the given genus. It performs a
     case-insensitive match by comparing the target genus against the 'name' field of
     the genus-level taxon or the first part of a multi-word taxon name.
-    
+
     Args:
         observation: A dictionary containing observation details with taxonomic information.
         target_genus: The genus name to match (case-insensitive).
-    
+
     Returns:
         True if the observation's taxonomy includes the target genus; otherwise, False.
     """
@@ -275,7 +280,7 @@ def check_observation_genus(observation, target_genus):
 def main():
     """
     Executes the iNaturalist observation finder process.
-    
+
     This function orchestrates the search for valid iNaturalist observations by:
     - Parsing command-line arguments and extracting an observation number from a URL or plain input.
     - Validating the observation number and warning the user if it appears too short (suggesting a possible Mushroom Observer observation).
@@ -283,7 +288,7 @@ def main():
     - Generating possible variations by altering digits and appending additional ones for shorter numbers.
     - Checking these variations in batches via API calls and displaying progress.
     - Presenting a summary of potential matches and the overall search duration.
-    
+
     Note: This function interacts with the user via input prompts and exits if critical validation fails.
     """
     args = parse_arguments()
@@ -359,7 +364,7 @@ def main():
         pbar = tqdm(total=total_variations, desc="Checking variations", unit="var")
 
     # Process in batches to minimize API calls
-    batch_size = 30  # iNaturalist API typically limits batch size
+    batch_size = 200  # Updated to use maximum allowed by iNaturalist API
     matches = []
 
     for i in range(0, len(variations), batch_size):
