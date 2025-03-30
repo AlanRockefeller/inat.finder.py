@@ -1,6 +1,6 @@
 # inat.finder.py
 
-**Version:** 1.2
+**Version:** 1.3
 **Author:** Alan Rockefeller
 **Release Date:** March 29, 2025
 
@@ -12,7 +12,7 @@ Since you probably are using this code because you have a DNA barcode which does
 
 This tool is particularly useful for sequence validators, researchers and iNaturalist power users who need to find specific observations but have encountered typos in their reference numbers.
 
-A Windows .exe is available here: https://github.com/AlanRockefeller/inat.finder.py/releases/tag/v1.2
+A Windows .exe is available here: https://github.com/AlanRockefeller/inat.finder.py/releases
 
 ## Features
 
@@ -22,9 +22,9 @@ A Windows .exe is available here: https://github.com/AlanRockefeller/inat.finder
 - **NEW:** For short numbers (<9 digits), tries adding up to two digits at beginning and/or end
 - **NEW:** Suggests checking Mushroom Observer for very short numbers (≤5 digits)
 - **NEW:** Can discover observations with missing digits from both beginning and end simultaneously
-- Efficiently queries the iNaturalist API with batched requests to minimize API calls
+- Efficiently queries the iNaturalist API with batched requests of 200 to minimize API calls
 - Respects rate limits by making no more than one API call per second
-- Shows a progress bar with estimated completion time by default
+- Shows a progress bar with estimated completion time
 - Provides optional verbose mode for detailed information about each attempt
 - Works with any genus and observation number combination
 
@@ -50,6 +50,8 @@ git clone https://github.com/AlanRockefeller/inat.finder.py.git
 cd inat.finder.py
 chmod +x inat_finder.py  # Make the script executable
 ```
+
+Or just copy the code from Github and paste it into a file.
 
 ## Usage
 
@@ -101,7 +103,7 @@ python inat_finder.py Boletus 123456789 --verbose
 3. The script first checks if the original observation number already matches the specified genus
 4. If not, it generates all possible variations of the number with the specified number of digits changed
 5. For short numbers (<9 digits), it also generates variations with 1-2 digits added at the beginning and/or end
-6. It batches these variations to efficiently query the iNaturalist API (30 IDs per request)
+6. It batches these variations to efficiently query the iNaturalist API (200 IDs per request)
 7. For each observation found, it checks if the genus matches what you're looking for
 8. It presents all matching observations, including direct links to view them on iNaturalist.org
 

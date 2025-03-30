@@ -1,6 +1,11 @@
 # Changelog
 All notable changes to the inat.finder.py project will be documented in this file.
 
+## [1.3] - 2025-03-29
+### Enhanced
+- Increased batch size from 30 to 200 observations per API request (the maximum allowed) to significantly reduce the number of API calls
+- Improved overall execution speed by approximately 85% due to fewer API requests and connection delays
+
 ## [1.2] - 2025-03-29
 ### Fixed
 - Included a Windows .exe
