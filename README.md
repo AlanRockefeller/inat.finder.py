@@ -12,7 +12,7 @@ Since you probably are using this code because you have a DNA barcode which does
 
 This tool is particularly useful for sequence validators, researchers and iNaturalist power users who need to find specific observations but have encountered typos in their reference numbers.
 
-A Windows .exe is available here: https://github.com/AlanRockefeller/inat.finder.py/releases
+A Windows .exe is available [here](https://github.com/AlanRockefeller/inat.finder.py/releases)
 
 ## Features
 
