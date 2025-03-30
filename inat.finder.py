@@ -2,7 +2,7 @@
 """
 iNaturalist Observation Finder
 
-Version 1.1 - By Alan Rockefeller - March 29, 2025
+Version 1.2 - By Alan Rockefeller - March 29, 2025
 
 This script helps find the correct iNaturalist observation number when there are mistyped digits.
 It works by systematically changing digits of the provided observation number and checking if
@@ -36,8 +36,18 @@ import time
 import sys
 from tqdm import tqdm
 from datetime import timedelta
+import textwrap
 
 def parse_arguments():
+    """Parse command line arguments."""
+    # Create a formatted description from the module docstring
+    description = textwrap.dedent(__doc__)
+    
+    parser = argparse.ArgumentParser(
+        description=description,
+        formatter_class=argparse.RawDescriptionHelpFormatter  # Use this to preserve formatting
+    )
+    
     """
     Parses command-line arguments for the iNaturalist observation finder.
     
@@ -50,7 +60,6 @@ def parse_arguments():
     Returns:
         argparse.Namespace: An object with attributes corresponding to the parsed arguments.
     """
-    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("genus", help="The genus name to match (e.g., 'Amanita')")
     parser.add_argument("observation_number", help="The potentially mistyped iNaturalist observation number or URL")
     parser.add_argument("--digits", type=int, default=1,
@@ -131,23 +140,31 @@ def generate_digit_additions(number_str, max_added_digits=2):
         A list of strings containing all generated variations.
     """
     variations = []
-    
-    # Add digits at the beginning only
-    for prefix_len in range(1, max_added_digits + 1):
-        for prefix in range(10**(prefix_len-1), 10**prefix_len):
-            variations.append(str(prefix) + number_str)
-    
-    # Add digits at the end only
-    for suffix_len in range(1, max_added_digits + 1):
-        for suffix in range(10**(suffix_len-1), 10**suffix_len):
-            variations.append(number_str + str(suffix))
-    
-    # Add digits at both beginning and end (for missing digits on both sides)
-    for prefix_len in range(1, max_added_digits + 1):
-        for suffix_len in range(1, max_added_digits + 1):
-            for prefix in range(10**(prefix_len-1), 10**prefix_len):
-                for suffix in range(10**(suffix_len-1), 10**suffix_len):
-                    variations.append(str(prefix) + number_str + str(suffix))
+
+    # Add single digits at the beginning only (0-9)
+    for digit in range(10):
+        variations.append(str(digit) + number_str)
+        
+    # Add single digits at the end only (0-9)
+    for digit in range(10):
+        variations.append(number_str + str(digit))
+        
+    # If max_added_digits is 2, add two digits
+    if max_added_digits >= 2:
+        # Add two digits at the beginning only
+        for first_digit in range(10):
+            for second_digit in range(10):
+                variations.append(str(first_digit) + str(second_digit) + number_str)
+                
+        # Add two digits at the end only
+        for first_digit in range(10):
+            for second_digit in range(10):
+                variations.append(number_str + str(first_digit) + str(second_digit))
+                
+        # Add one digit at beginning and one at end
+        for prefix in range(10):
+            for suffix in range(10):
+                variations.append(str(prefix) + number_str + str(suffix))
     
     return variations
 
@@ -168,7 +185,7 @@ def parse_inat_url(url_or_number):
         observation number is found.
     """
     import re
-    
+
     # Check if it's a URL
     if url_or_number.startswith(('http://', 'https://')):
         # Use regex to extract the observation number from the URL
@@ -279,23 +296,23 @@ def main():
 
     # Parse URL if provided
     obs_number = parse_inat_url(obs_input)
-    
+
     if verbose:
         print(f"Input: {obs_input}")
         if obs_input != obs_number:
             print(f"Extracted observation number: {obs_number}")
-    
+
     if not obs_number.isdigit():
         print("Error: Observation number must contain only digits")
         print("Input provided: " + obs_input)
         sys.exit(1)
-    
+
     # Check for Mushroom Observer numbers (5 digits or less)
     if len(obs_number) <= 5:
         print(f"Note: The observation number {obs_number} is very short (5 digits or less).")
         print(f"This might be a Mushroom Observer observation rather than iNaturalist.")
         print(f"Consider checking: https://mushroomobserver.org/{obs_number}")
-        
+
         user_input = input("Continue with iNaturalist search anyway? (y/n): ").strip().lower()
         if user_input != 'y':
             print("Exiting search.")
@@ -321,7 +338,7 @@ def main():
 
     # Generate all possible variations with specified digits changed
     variations = generate_digit_variations(obs_number, digits_off)
-    
+
     # If the observation number has fewer than 9 digits, try adding digits
     additional_variations = []
     if len(obs_number) < 9:
@@ -329,7 +346,7 @@ def main():
         additional_variations = generate_digit_additions(obs_number, 2)
         print(f"Generated {len(additional_variations)} additional variations by adding digits")
         variations.extend(additional_variations)
-    
+
     total_variations = len(variations)
     print(f"Generated {total_variations} total possible variations to check")
 
