@@ -310,7 +310,7 @@ def main():
     # Check for Mushroom Observer numbers (5 digits or less)
     if len(obs_number) <= 5:
         print(f"Note: The observation number {obs_number} is very short (5 digits or less).")
-        print(f"This might be a Mushroom Observer observation rather than iNaturalist.")
+        print("This might be a Mushroom Observer observation rather than iNaturalist.")
         print(f"Consider checking: https://mushroomobserver.org/{obs_number}")
 
         user_input = input("Continue with iNaturalist search anyway? (y/n): ").strip().lower()
@@ -342,7 +342,7 @@ def main():
     # If the observation number has fewer than 9 digits, try adding digits
     additional_variations = []
     if len(obs_number) < 9:
-        print(f"Observation number has fewer than 9 digits. Will also try adding digits...")
+        print("Observation number has fewer than 9 digits. Will also try adding digits...")
         additional_variations = generate_digit_additions(obs_number, 2)
         print(f"Generated {len(additional_variations)} additional variations by adding digits")
         variations.extend(additional_variations)

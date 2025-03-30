@@ -12,6 +12,8 @@ Since you probably are using this code because you have a DNA barcode which does
 
 This tool is particularly useful for sequence validators, researchers and iNaturalist power users who need to find specific observations but have encountered typos in their reference numbers.
 
+A Windows .exe is available here: https://github.com/AlanRockefeller/inat.finder.py/releases/tag/v1.2
+
 ## Features
 
 - Checks if the original observation number already matches the genus before searching for variations
