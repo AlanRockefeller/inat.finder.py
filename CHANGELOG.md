@@ -1,6 +1,19 @@
 # Changelog
 All notable changes to the inat.finder.py project will be documented in this file.
 
+## [1.4] - 2025-04-01
+### Added
+- New --user argument to search by username instead of genus (Thanks to Scott Ostuni for the suggestion)
+- Modified the script to require either --genus or --user flag (previous positional genus argument no longer supported)
+- Added verification to check if the specified genus exists in iNaturalist taxonomy
+- Added verification to check if the specified username exists on iNaturalist
+- Enhanced results display to include the creator username for all matches
+
+### Changed
+- Command-line interface now requires --genus or --user flag instead of positional arguments
+- Updated help text to explain the new command-line options
+- Updated internal documentation to reflect new search capabilities
+
 ## [1.3] - 2025-03-29
 ### Enhanced
 - Increased batch size from 30 to 200 observations per API request (the maximum allowed) to significantly reduce the number of API calls
@@ -16,7 +29,7 @@ All notable changes to the inat.finder.py project will be documented in this fil
 ### Added
 - Support for parsing observation numbers directly from iNaturalist URLs
 - Feature to detect and suggest Mushroom Observer for very short numbers (≤5 digits)
-- Capability to handle missing digits at both the beginning and end simultaneously
+- Capability to handle missing digits at both the beginning and end simultaneously (Thanks to Alisha Millican for the suggestion)
 - For observation numbers with fewer than 9 digits, now tries adding up to two digits at the beginning and/or end
 - More comprehensive documentation about the new features
 

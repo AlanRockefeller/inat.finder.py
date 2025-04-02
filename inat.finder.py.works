@@ -2,12 +2,12 @@
 """
 iNaturalist Observation Finder
 
-Version 1.4 - By Alan Rockefeller - April 1, 2025
-(Now with improved batch processing and user search)
+Version 1.3 - By Alan Rockefeller - March 29, 2025
+(Optimized version with improved batch processing)
 
 This script helps find the correct iNaturalist observation number when there are mistyped digits.
 It works by systematically changing digits of the provided observation number and checking if
-any of those variations match the specified genus or username in the iNaturalist database.
+any of those variations match the specified genus in the iNaturalist database.
 
 If the observation number has fewer than 9 digits, it will also try adding up to two digits
 at the beginning and end of the number, including combinations of adding digits to both ends.
@@ -18,16 +18,15 @@ Mushroom Observer observation number instead.
 The script can also parse observation numbers directly from iNaturalist URLs.
 
 Usage:
-    python inat.finder.py (--genus <genus> | --user <username>) <observation_number_or_url> [options]
+    python inat.finder.py <genus> <observation_number_or_url> [options]
 
 Arguments:
-    --genus <genus>         The genus name to match (e.g., "Galerina")
-    --user <username>       The iNaturalist username to match (e.g., "alanrockefeller")
+    genus                   The genus name to match (e.g., "Galerina")
     observation_number_or_url  The potentially mistyped iNaturalist observation number
                                or a complete iNaturalist URL
 
 Options:
-    --digits N          Number of digits that might be wrong (default: 1)
+    --digits N      Number of digits that might be wrong (default: 1)
     --verbose           Print detailed information about each attempt
     --no-progress       Hide the progress bar (progress bar is shown by default)
 """
@@ -53,7 +52,7 @@ def parse_arguments():
     """
     Parses command-line arguments for the iNaturalist observation finder.
 
-    This function sets up an argument parser to accept either a genus name or a username, and a
+    This function sets up an argument parser to accept a required genus name and a
     potentially mistyped observation number (or URL). It also supports options to specify
     the number of digits that might be incorrect (default: 1), enable verbose output, and
     disable the progress bar. If no arguments are provided, the help message is printed and
@@ -62,11 +61,7 @@ def parse_arguments():
     Returns:
         argparse.Namespace: An object with attributes corresponding to the parsed arguments.
     """
-    search_group = parser.add_argument_group('search criteria (one required)')
-    group = search_group.add_mutually_exclusive_group(required=True)
-    group.add_argument("--genus", help="The genus name to match (e.g., 'Amanita')")
-    group.add_argument("--user", help="The iNaturalist username to match")
-    
+    parser.add_argument("genus", help="The genus name to match (e.g., 'Amanita')")
     parser.add_argument("observation_number", help="The potentially mistyped iNaturalist observation number or URL")
     parser.add_argument("--digits", type=int, default=1,
                         help="Number of digits that might be wrong (default: 1)")
@@ -80,13 +75,7 @@ def parse_arguments():
         parser.print_help()
         sys.exit(1)
 
-    args = parser.parse_args()
-    
-    # Ensure either genus or user is provided
-    if not args.genus and not args.user:
-        parser.error("Either --genus or --user is required")
-        
-    return args
+    return parser.parse_args()
 
 def generate_digit_variations(number_str, digits_off=1):
     """
@@ -179,65 +168,6 @@ def generate_digit_additions(number_str, max_added_digits=2):
                 variations.append(str(prefix) + number_str + str(suffix))
 
     return variations
-
-def verify_user_exists(username):
-    """
-    Verify if a username exists on iNaturalist.
-    
-    Makes an API call to check if the specified username exists in the iNaturalist database.
-    
-    Args:
-        username: The username to verify.
-        
-    Returns:
-        bool: True if the username exists, False otherwise.
-    """
-    try:
-        url = f"https://api.inaturalist.org/v1/users/autocomplete?q={username}"
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        
-        # Check if any user matches the exact username
-        if 'results' in data and data['results']:
-            for user in data['results']:
-                if user.get('login', '').lower() == username.lower():
-                    return True
-        
-        return False
-    except requests.RequestException as e:
-        print(f"Error verifying username: {e}")
-        return False
-
-def verify_genus_exists(genus):
-    """
-    Verify if a genus exists in the iNaturalist taxonomy.
-    
-    Makes an API call to check if the specified genus exists in the iNaturalist taxonomy database.
-    
-    Args:
-        genus: The genus name to verify.
-        
-    Returns:
-        bool: True if the genus exists, False otherwise.
-    """
-    try:
-        url = f"https://api.inaturalist.org/v1/taxa/autocomplete?q={genus}&rank=genus"
-        response = requests.get(url)
-        response.raise_for_status()
-        data = response.json()
-        
-        # Check if any taxon matches the exact genus name and is of rank genus
-        if 'results' in data and data['results']:
-            for taxon in data['results']:
-                if (taxon.get('name', '').lower() == genus.lower() and 
-                    taxon.get('rank', '') == 'genus'):
-                    return True
-        
-        return False
-    except requests.RequestException as e:
-        print(f"Error verifying genus: {e}")
-        return False
 
 def parse_inat_url(url_or_number):
     """
@@ -347,38 +277,14 @@ def check_observation_genus(observation, target_genus):
 
     return False
 
-def check_observation_user(observation, target_username):
-    """
-    Determine if an observation was created by the specified username.
-
-    This function checks if the user who created the observation matches the
-    provided username. It performs a case-insensitive comparison between the 
-    target username and the observation's user login name.
-
-    Args:
-        observation: A dictionary containing observation details including user information.
-        target_username: The username to match (case-insensitive).
-
-    Returns:
-        True if the observation was created by the target user; otherwise, False.
-    """
-    if observation and 'user' in observation:
-        user = observation['user']
-        if user and 'login' in user:
-            if user['login'].lower() == target_username.lower():
-                return True
-    
-    return False
-
 def main():
     """
     Executes the iNaturalist observation finder process.
 
     This function orchestrates the search for valid iNaturalist observations by:
     - Parsing command-line arguments and extracting an observation number from a URL or plain input.
-    - Verifying that the specified genus or username exists in iNaturalist.
     - Validating the observation number and warning the user if it appears too short (suggesting a possible Mushroom Observer observation).
-    - Optionally confirming whether the original observation number already matches the target genus or username.
+    - Optionally confirming whether the original observation number already matches the target genus.
     - Generating possible variations by altering digits and appending additional ones for shorter numbers.
     - Checking these variations in batches via API calls and displaying progress.
     - Presenting a summary of potential matches and the overall search duration.
@@ -388,30 +294,10 @@ def main():
     args = parse_arguments()
 
     genus = args.genus
-    username = args.user
     obs_input = args.observation_number
     digits_off = args.digits
     verbose = args.verbose
     show_progress = not args.no_progress
-
-    # Determine search mode
-    search_mode = "genus" if genus else "user"
-    search_term = genus if search_mode == "genus" else username
-
-    # Verify that the genus or user exists before proceeding
-    print(f"Verifying {search_mode} '{search_term}' exists on iNaturalist...")
-    if search_mode == "genus":
-        if not verify_genus_exists(genus):
-            print(f"Error: Genus '{genus}' not found in iNaturalist taxonomy.")
-            print("Please check the spelling or try a different genus name.")
-            sys.exit(1)
-        print(f"✓ Genus '{genus}' verified in iNaturalist taxonomy.")
-    else:  # User mode
-        if not verify_user_exists(username):
-            print(f"Error: Username '{username}' not found on iNaturalist.")
-            print("Please check the spelling or try a different username.")
-            sys.exit(1)
-        print(f"✓ Username '{username}' verified on iNaturalist.")
 
     # Parse URL if provided
     obs_number = parse_inat_url(obs_input)
@@ -439,32 +325,21 @@ def main():
 
     # First, check if the original observation number is correct
     if verbose:
-        print(f"Checking if original observation number {obs_number} matches {search_mode} '{search_term}'...")
+        print(f"Checking if original observation number {obs_number} matches genus '{genus}'...")
 
     # Make a single API call to check the original number
     original_check = batch_check_observations([obs_number], 1)
-    if original_check:
-        match_found = False
-        if search_mode == "genus" and check_observation_genus(original_check[0], genus):
-            match_found = True
-            print(f"✓ Good news! The original observation number {obs_number} already matches genus {genus}.")
-            print(f"  Taxon: {original_check[0].get('taxon', {}).get('name', 'Unknown taxon')}")
-        elif search_mode == "user" and check_observation_user(original_check[0], username):
-            match_found = True
-            print(f"✓ Good news! The original observation number {obs_number} was created by user {username}.")
-            print(f"  Taxon: {original_check[0].get('taxon', {}).get('name', 'Unknown taxon')}")
-        
-        if match_found:
-            print(f"  URL: https://www.inaturalist.org/observations/{obs_number}")
-            user_input = input("Continue searching for other potential matches? (y/n): ").strip().lower()
-            if user_input != 'y':
-                print("Exiting search.")
-                return
+    if original_check and check_observation_genus(original_check[0], genus):
+        print(f"✓ Good news! The original observation number {obs_number} already matches genus {genus}.")
+        print(f"  Taxon: {original_check[0].get('taxon', {}).get('name', 'Unknown taxon')}")
+        print(f"  URL: https://www.inaturalist.org/observations/{obs_number}")
 
-    if search_mode == "genus":
-        print(f"Looking for iNaturalist observations with genus '{genus}' that might be {digits_off} digit(s) off from '{obs_number}'")
-    else:
-        print(f"Looking for iNaturalist observations created by user '{username}' that might be {digits_off} digit(s) off from '{obs_number}'")
+        user_input = input("Continue searching for other potential matches? (y/n): ").strip().lower()
+        if user_input != 'y':
+            print("Exiting search.")
+            return
+
+    print(f"Looking for iNaturalist observations with genus '{genus}' that might be {digits_off} digit(s) off from '{obs_number}'")
 
     # Generate all possible variations with specified digits changed
     variations = generate_digit_variations(obs_number, digits_off)
@@ -513,28 +388,14 @@ def main():
 
         for obs in results:
             obs_id = obs.get('id')
-            match_found = False
-            
-            if search_mode == "genus" and check_observation_genus(obs, genus):
-                match_found = True
+            if check_observation_genus(obs, genus):
                 matches.append(obs)
                 if verbose:
                     print(f"✓ Match found: Observation {obs_id} has genus {genus}")
                     if 'taxon' in obs and 'name' in obs['taxon']:
                         print(f"  Taxon: {obs['taxon']['name']}")
-            elif search_mode == "user" and check_observation_user(obs, username):
-                match_found = True
-                matches.append(obs)
-                if verbose:
-                    print(f"✓ Match found: Observation {obs_id} was created by user {username}")
-                    if 'taxon' in obs and 'name' in obs['taxon']:
-                        print(f"  Taxon: {obs['taxon']['name']}")
-                        
-            if not match_found and verbose:
-                if search_mode == "genus":
-                    print(f"✗ Observation {obs_id} does not match genus {genus}")
-                else:
-                    print(f"✗ Observation {obs_id} was not created by user {username}")
+            elif verbose:
+                print(f"✗ Observation {obs_id} does not match genus {genus}")
 
         # Update progress bar
         if show_progress:
@@ -550,17 +411,12 @@ def main():
         for i, match in enumerate(matches, 1):
             obs_id = match.get('id')
             taxon_name = match.get('taxon', {}).get('name', 'Unknown taxon')
-            creator = match.get('user', {}).get('login', 'Unknown user')
             print(f"{i}. Observation #{obs_id} - {taxon_name}")
-            print(f"   Created by: {creator}")
             print(f"   URL: https://www.inaturalist.org/observations/{obs_id}")
     else:
         print("\nNo matches found. Consider these possibilities:")
         print("1. The observation may have more than one digit mistyped")
-        if search_mode == "genus":
-            print("2. The genus name might be incorrect")
-        else:
-            print("2. The username might be incorrect")
+        print("2. The genus name might be incorrect")
         print("3. The observation might not exist or has been removed")
         if len(obs_number) <= 5:
             print("4. This might be a Mushroom Observer number: https://mushroomobserver.org/" + obs_number)
