@@ -82,6 +82,10 @@ def parse_arguments():
 
     args = parser.parse_args()
     
+    # Ensure either genus or user is provided
+    if not args.genus and not args.user:
+        parser.error("Either --genus or --user is required")
+        
     return args
 
 def generate_digit_variations(number_str, digits_off=1):
@@ -189,7 +193,7 @@ def verify_user_exists(username):
         bool: True if the username exists, False otherwise.
     """
     try:
-        url = f"https://api.inaturalist.org/v1/users/{username}"
+        url = f"https://api.inaturalist.org/v1/users/autocomplete?q={username}"
         response = requests.get(url)
         response.raise_for_status()
         data = response.json()
@@ -360,8 +364,9 @@ def check_observation_user(observation, target_username):
     """
     if observation and 'user' in observation:
         user = observation['user']
-        if user and 'login' in user and user['login'].lower() == target_username.lower():
-            return True
+        if user and 'login' in user:
+            if user['login'].lower() == target_username.lower():
+                return True
     
     return False
 
