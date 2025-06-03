@@ -32,13 +32,14 @@ Options:
 """
 
 import argparse
-import requests
-import time
-import sys
-from tqdm import tqdm
-from datetime import timedelta
-import textwrap
 import itertools
+import re
+import sys
+import textwrap
+import time
+from datetime import timedelta
+import requests
+from tqdm import tqdm
 
 def parse_arguments():
     """
@@ -190,7 +191,7 @@ def verify_user_exists(username):
     """
     try:
         url = f"https://api.inaturalist.org/v1/users/{username}"
-        response = requests.get(url)
+        response = requests.get(url, timeout=20)
         response.raise_for_status()
         data = response.json()
         
@@ -222,7 +223,7 @@ def verify_genus_exists(genus):
     """
     try:
         url = f"https://api.inaturalist.org/v1/taxa/autocomplete?q={genus}&rank=genus"
-        response = requests.get(url)
+        response = requests.get(url, timeout=20)
         response.raise_for_status()
         data = response.json()
         
@@ -257,7 +258,6 @@ def parse_inat_url(url_or_number):
         A string containing the extracted observation number, or the original input if no valid
         observation number is found.
     """
-    import re
 
     # Check if it's a URL
     if url_or_number.startswith(('http://', 'https://')):
@@ -299,7 +299,7 @@ def batch_check_observations(variations, batch_size=200):
         url = f"https://api.inaturalist.org/v1/observations?id={ids_string}&per_page={batch_size}"
 
         try:
-            response = requests.get(url)
+            response = requests.get(url, timeout=20)
             response.raise_for_status()
             data = response.json()
 
@@ -386,7 +386,7 @@ def main():
 
     Note: This function interacts with the user via input prompts and exits if critical validation fails.
     """
-    BATCH_SIZE = 200  # Define batch size as a constant
+    batch_size = 200  # Define batch size as a constant
 
     args = parse_arguments()
 
@@ -489,7 +489,7 @@ def main():
     
     # For ETA calculation
     batch_times = []
-    MAX_BATCH_TIMES_TO_AVERAGE = 5 
+    max_batch_times_to_average = 5 
 
     if show_progress:
         pbar = tqdm(total=total_variations, desc="Checking variations", unit="var")
@@ -497,20 +497,20 @@ def main():
     # Process in batches to minimize API calls
     matches = []
 
-    for i in range(0, len(variations), BATCH_SIZE):
-        batch = variations[i:i+BATCH_SIZE]
+    for i in range(0, len(variations), batch_size):
+        batch = variations[i:i+batch_size]
 
         if verbose:
-            print(f"\nChecking batch of {len(batch)} variations ({i+1}-{min(i+BATCH_SIZE, total_variations)} of {total_variations})")
+            print(f"\nChecking batch of {len(batch)} variations ({i+1}-{min(i+batch_size, total_variations)} of {total_variations})")
             print(f"Variations in this batch: {', '.join(batch)}")
 
         batch_start_time = time.time()
-        results = batch_check_observations(batch, BATCH_SIZE)
+        results = batch_check_observations(batch, batch_size)
         batch_end_time = time.time()
 
         current_batch_time = batch_end_time - batch_start_time
         batch_times.append(current_batch_time)
-        if len(batch_times) > MAX_BATCH_TIMES_TO_AVERAGE:
+        if len(batch_times) > max_batch_times_to_average:
             batch_times.pop(0) # Keep only the last N times
 
         if show_progress and pbar:
@@ -523,8 +523,8 @@ def main():
                 # The number of batches already processed is (pbar.n + len(batch)) / batch_size
                 # Total batches approx total_variations / batch_size
                 # Remaining batches = total_batches - processed_batches
-                # A simpler way: remaining_items / BATCH_SIZE
-                remaining_batches = remaining_items / BATCH_SIZE
+                # A simpler way: remaining_items / batch_size
+                remaining_batches = remaining_items / batch_size
                 
                 estimated_remaining_time = average_batch_time * remaining_batches
                 pbar.set_postfix({"ETA": str(timedelta(seconds=int(estimated_remaining_time)))})
