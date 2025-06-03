@@ -21,7 +21,7 @@ Usage:
 
 Arguments:
     --genus <genus>         The genus name to match (e.g., "Galerina")
-    --user <username>       The iNaturalist username to match (e.g., "alanrockefeller")
+    --user <username>       The iNaturalist username to match (e.g., "alan_rockefeller")
     observation_number_or_url  The potentially mistyped iNaturalist observation number
                                or a complete iNaturalist URL
 

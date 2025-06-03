@@ -67,8 +67,7 @@ python inat_finder.py (--genus <genus> | --user <username>) <observation_number_
 
 - Either:
   - `--genus <genus>`: The genus name to match (e.g., "Amanita")
-  - `--user <username>`: The iNaturalist username to match (e.g., "maractwin") 
-    *(Note: "alanrockefeller" used in older examples may no longer be a valid active username for API checks)*
+  - `--user <username>`: The iNaturalist username to match (e.g., "alan_rockefeller") 
 - `observation_number_or_url`: The potentially mistyped iNaturalist observation number or a complete iNaturalist URL
 
 ### Options
