@@ -1,12 +1,12 @@
 # inat.finder.py
 
-**Version:** 1.4
+**Version:** 1.5
 **Author:** Alan Rockefeller
-**Release Date:** April 1, 2025
+**Release Date:** June 2, 2025
 
 ## Overview
 
-inat.finder.py is a command-line tool for finding the correct iNaturalist observation when you have a mistyped observation number. The script works by systematically changing digits in the provided observation number and checking if any of those variations match the specified genus or username in the iNaturalist database.
+inat_finder.py is a command-line tool for finding the correct iNaturalist observation when you have a mistyped observation number. The script works by systematically changing digits in the provided observation number and checking if any of those variations match the specified genus or username in the iNaturalist database.
 
 Since you probably are using this code because you have a DNA barcode which does not go to the correct iNaturalist observation (for example it shows a plant or a bird), you probably know the genus. Alternatively, if you know the username of the observer, you can now search by that instead.
 
@@ -16,19 +16,20 @@ A Windows .exe is available [here](https://github.com/AlanRockefeller/inat.finde
 
 ## Features
 
-- **NEW:** Search by either genus name or iNaturalist username
-- **NEW:** Verifies that the specified genus or username exists before searching
+- Search by either genus name or iNaturalist username
+- Verifies that the specified genus or username exists before searching
 - Checks if the original observation number already matches the genus or username before searching for variations
-- Generates all possible variations with a configurable number of digits that might be wrong (default: 1)
+- Generates all possible variations with a configurable number of digits that might be wrong (default: 1) - *Now more robust for multiple digits off!*
 - Supports parsing observation numbers directly from iNaturalist URLs
 - For short numbers (<9 digits), tries adding up to two digits at beginning and/or end
 - Suggests checking Mushroom Observer for very short numbers (≤5 digits)
 - Can discover observations with missing digits from both beginning and end simultaneously
 - Efficiently queries the iNaturalist API with batched requests of 200 to minimize API calls
 - Respects rate limits by making no more than one API call per second
-- Shows a progress bar with estimated completion time
+- Shows a progress bar with estimated completion time (ETA now more accurate)
 - Provides optional verbose mode for detailed information about each attempt
 - Works with any genus/username and observation number combination
+- Includes a comprehensive unit test suite for maintainability.
 
 ## Installation
 
@@ -49,11 +50,12 @@ pip install requests tqdm
 
 ```bash
 git clone https://github.com/AlanRockefeller/inat.finder.py.git
-cd inat.finder.py
+cd inat.finder.py 
+# The script is now named inat_finder.py
 chmod +x inat_finder.py  # Make the script executable
 ```
 
-Or just copy the code from Github and paste it into a file.
+Or just copy the code from Github and paste it into a file named `inat_finder.py`.
 
 ## Usage
 
@@ -65,7 +67,8 @@ python inat_finder.py (--genus <genus> | --user <username>) <observation_number_
 
 - Either:
   - `--genus <genus>`: The genus name to match (e.g., "Amanita")
-  - `--user <username>`: The iNaturalist username to match (e.g., "alanrockefeller")
+  - `--user <username>`: The iNaturalist username to match (e.g., "maractwin") 
+    *(Note: "alanrockefeller" used in older examples may no longer be a valid active username for API checks)*
 - `observation_number_or_url`: The potentially mistyped iNaturalist observation number or a complete iNaturalist URL
 
 ### Options
@@ -85,7 +88,7 @@ python inat_finder.py --genus Amanita 123456789
 Search for observations by a specific user with one digit off from 123456789:
 
 ```bash
-python inat_finder.py --user alanrockefeller 123456789
+python inat_finder.py --user maractwin 123456789
 ```
 
 Use a full iNaturalist URL instead of just an observation number:
@@ -108,15 +111,16 @@ python inat_finder.py --genus Boletus 123456789 --verbose
 
 ## How It Works
 
-1. The script first verifies that the specified genus or username exists on iNaturalist
-2. If a URL is provided, the script extracts the observation number from it
-3. For very short numbers (5 digits or less), it suggests checking Mushroom Observer
-4. The script checks if the original observation number already matches the specified genus or username
-5. If not, it generates all possible variations of the number with the specified number of digits changed
-6. For short numbers (<9 digits), it also generates variations with 1-2 digits added at the beginning and/or end
-7. It batches these variations to efficiently query the iNaturalist API (200 IDs per request)
-8. For each observation found, it checks if the genus or username matches what you're looking for
-9. It presents all matching observations, including the creator username and direct links to view them on iNaturalist.org
+1. The script first verifies that the specified genus or username exists on iNaturalist (API error messages are now more detailed).
+2. If a URL is provided, the script extracts the observation number from it.
+3. For very short numbers (5 digits or less), it suggests checking Mushroom Observer.
+4. The script checks if the original observation number already matches the specified genus or username.
+5. If not, it generates all possible variations of the number with the specified number of digits changed (generation logic for multiple differing digits is now corrected and robust).
+6. For short numbers (<9 digits), it also generates variations with 1-2 digits added at the beginning and/or end (this logic has been refactored for clarity).
+7. It batches these variations to efficiently query the iNaturalist API (200 IDs per request).
+8. For each observation found, it checks if the genus or username matches what you're looking for.
+9. It presents all matching observations, including the creator username and direct links to view them on iNaturalist.org.
+10. The progress bar's Estimated Time of Arrival (ETA) is now more accurate due to a refined calculation method.
 
 ## Performance Considerations
 
@@ -127,8 +131,8 @@ The number of variations grows exponentially with the number of digits that migh
 - For a 9-digit number with 3 digits off: ~84,240 variations
 
 For shorter numbers, additional variations are generated by adding digits:
-- For an 8-digit number: ~200 additional variations (1-2 digits added at either end or both ends)
-- For a 7-digit number: ~200 additional variations (1-2 digits added at either end or both ends)
+- For an 8-digit number: 320 additional variations (1-2 digits added at either end or both ends)
+- For a 7-digit number: 320 additional variations
 
 Be cautious when setting high values for `--digits` as it can result in very long execution times and many API calls.
 
@@ -150,6 +154,14 @@ This project is available under the GNU Public License 3.0. See the LICENSE file
 - Thanks to Alisha Millican and Scott Ostuni for suggesting new features
 
 ## Change Log
+
+### Version 1.5 (June 2, 2025)
+- Corrected a significant bug in generating variations for multiple differing digits.
+- Refactored digit addition logic for clarity.
+- Improved progress bar ETA accuracy.
+- Renamed script to `inat_finder.py` for better module handling.
+- Enhanced API error messages.
+- Added a comprehensive unit test suite.
 
 ### Version 1.4 (April 1, 2025)
 - Added ability to search by username instead of genus with the new --user flag
