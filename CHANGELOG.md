@@ -1,6 +1,19 @@
 # Changelog
 All notable changes to the inat.finder.py project will be documented in this file.
 
+## [1.5] - 2025-06-02
+### Fixed
+- Corrected a significant bug in `generate_digit_variations` for `digits_off > 1` which led to incorrect/incomplete results. The function now accurately generates all unique variations.
+
+### Changed
+- Refactored `generate_digit_additions` for improved clarity and conciseness using `itertools.product`.
+- Improved Progress Bar ETA calculation in `main` function to use a moving average of recent batch processing times for better accuracy.
+- Renamed script from `inat.finder.py` to `inat_finder.py` 
+- Enhanced API error messages in `verify_genus_exists` and `verify_user_exists` to be more specific by including HTTP status codes when available.
+
+### Added
+- Added a comprehensive suite of unit tests (`test_inat_finder.py`) covering key functions: `generate_digit_variations`, `generate_digit_additions`, and `parse_inat_url`.
+
 ## [1.4] - 2025-04-01
 ### Added
 - New --user argument to search by username instead of genus (Thanks to Scott Ostuni for the suggestion)
