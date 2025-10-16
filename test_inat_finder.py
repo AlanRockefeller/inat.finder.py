@@ -1,5 +1,5 @@
 import unittest
-from inat_finder import generate_digit_variations, generate_digit_additions, parse_inat_url
+from inat_finder import generate_digit_variations, generate_digit_additions, parse_inat_url, generate_digit_removals
 
 class TestInatFinderFunctions(unittest.TestCase):
     # Test methods for generate_digit_variations
@@ -178,6 +178,31 @@ class TestInatFinderFunctions(unittest.TestCase):
     def test_piu_url_no_number(self):
         self.assertEqual(parse_inat_url("https://www.inaturalist.org/observations/abc"), "https://www.inaturalist.org/observations/abc")
         self.assertEqual(parse_inat_url("https://www.inaturalist.org/observations/"), "https://www.inaturalist.org/observations/")
+
+    # Test methods for generate_digit_removals
+    def test_gdr_remove_one(self):
+        variations = generate_digit_removals("123", max_removed_digits=1)
+        self.assertEqual(len(variations), 3)
+        self.assertCountEqual(variations, ["12", "13", "23"])
+
+    def test_gdr_remove_up_to_two(self):
+        variations = generate_digit_removals("1234", max_removed_digits=2)
+        # remove 1: 123, 124, 134, 234 (4)
+        # remove 2: 12, 13, 14, 23, 24, 34 (6)
+        expected = ["123", "124", "134", "234", "12", "13", "14", "23", "24", "34"]
+        self.assertEqual(len(variations), 10)
+        self.assertCountEqual(variations, expected)
+
+    def test_gdr_uniqueness(self):
+        variations = generate_digit_removals("112", max_removed_digits=1)
+        self.assertEqual(len(variations), 2) # "11", "12"
+        self.assertCountEqual(variations, ["11", "12"])
+
+    def test_gdr_empty_and_short(self):
+        self.assertEqual(generate_digit_removals("", 2), [])
+        self.assertEqual(generate_digit_removals("1", 2), [])
+        self.assertEqual(generate_digit_removals("1", 1), [])
+        self.assertCountEqual(generate_digit_removals("12", 2), ["1", "2"])
 
 
 if __name__ == '__main__':
