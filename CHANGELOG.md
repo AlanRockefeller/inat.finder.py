@@ -1,6 +1,10 @@
 # Changelog
 All notable changes to the inat.finder.py project will be documented in this file.
 
+## [1.6] - 2025-10-16
+### Added
+- For observation numbers with more than 5 digits, the script now also tries removing one or two digits to find a match.  Thanks to Ryan Peace for the suggestion!
+
 ## [1.5] - 2025-06-02
 ### Fixed
 - Corrected a significant bug in `generate_digit_variations` for `digits_off > 1` which led to incorrect/incomplete results. The function now accurately generates all unique variations.

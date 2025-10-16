@@ -1,8 +1,8 @@
 # inat.finder.py
 
-**Version:** 1.5
+**Version:** 1.6
 **Author:** Alan Rockefeller
-**Release Date:** June 2, 2025
+**Release Date:** October 16, 2025
 
 ## Overview
 
@@ -22,6 +22,7 @@ A Windows .exe is available [here](https://github.com/AlanRockefeller/inat.finde
 - Generates all possible variations with a configurable number of digits that might be wrong (default: 1) - *Now more robust for multiple digits off!*
 - Supports parsing observation numbers directly from iNaturalist URLs
 - For short numbers (<9 digits), tries adding up to two digits at beginning and/or end
+- For long numbers (>5 digits), tries removing one or two digits.
 - Suggests checking Mushroom Observer for very short numbers (≤5 digits)
 - Can discover observations with missing digits from both beginning and end simultaneously
 - Efficiently queries the iNaturalist API with batched requests of 200 to minimize API calls
@@ -116,10 +117,11 @@ python inat_finder.py --genus Boletus 123456789 --verbose
 4. The script checks if the original observation number already matches the specified genus or username.
 5. If not, it generates all possible variations of the number with the specified number of digits changed (generation logic for multiple differing digits is now corrected and robust).
 6. For short numbers (<9 digits), it also generates variations with 1-2 digits added at the beginning and/or end (this logic has been refactored for clarity).
-7. It batches these variations to efficiently query the iNaturalist API (200 IDs per request).
-8. For each observation found, it checks if the genus or username matches what you're looking for.
-9. It presents all matching observations, including the creator username and direct links to view them on iNaturalist.org.
-10. The progress bar's Estimated Time of Arrival (ETA) is now more accurate due to a refined calculation method.
+7. For long numbers (>5 digits), it also generates variations with 1-2 digits removed.
+8. It batches these variations to efficiently query the iNaturalist API (200 IDs per request).
+9. For each observation found, it checks if the genus or username matches what you're looking for.
+10. It presents all matching observations, including the creator username and direct links to view them on iNaturalist.org.
+11. The progress bar's Estimated Time of Arrival (ETA) is now more accurate due to a refined calculation method.
 
 ## Performance Considerations
 
@@ -153,6 +155,9 @@ This project is available under the GNU Public License 3.0. See the LICENSE file
 - Thanks to Alisha Millican and Scott Ostuni for suggesting new features
 
 ## Change Log
+
+### Version 1.6 (October 16, 2025)
+- For observation numbers with more than 5 digits, the script now also tries removing one or two digits to find a match.
 
 ### Version 1.5 (June 2, 2025)
 - Corrected a significant bug in generating variations for multiple differing digits.

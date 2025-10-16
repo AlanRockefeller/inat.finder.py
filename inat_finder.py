@@ -2,7 +2,7 @@
 """
 iNaturalist Observation Finder
 
-Version 1.5 - By Alan Rockefeller - June 2, 2025
+Version 1.6 - By Alan Rockefeller - October 16, 2025
 
 This script helps find the correct iNaturalist observation number when there are mistyped digits.
 It works by systematically changing digits of the provided observation number and checking if
@@ -176,6 +176,38 @@ def generate_digit_additions(number_str, max_added_digits=2):
             variations.append(str(p) + number_str + str(s))
             
     return variations
+
+
+def generate_digit_removals(number_str, max_removed_digits=2):
+    """
+    Generate observation number variations by removing digits.
+
+    This function produces unique variations of the input observation number by removing a given
+    number of digits from any position.
+
+    Args:
+        number_str (str): The original observation number.
+        max_removed_digits (int, optional): The maximum number of digits to remove. Defaults to 2.
+
+    Returns:
+        List[str]: A list of unique observation number variations.
+    """
+    variations = set()
+    n = len(number_str)
+    
+    if n == 0:
+        return []
+
+    # Determine how many digits to remove, from 1 to max_removed_digits
+    for num_to_remove in range(1, min(max_removed_digits, n) + 1):
+        # Find all combinations of indices to keep
+        for indices_to_keep in itertools.combinations(range(n), n - num_to_remove):
+            new_str = "".join(number_str[i] for i in indices_to_keep)
+            if new_str: # Avoid adding empty strings if all digits are removed
+                variations.add(new_str)
+                
+    return list(variations)
+
 
 def verify_user_exists(username):
     """
@@ -479,6 +511,13 @@ def main():
         additional_variations = generate_digit_additions(obs_number, 2)
         print(f"Generated {len(additional_variations)} additional variations by adding digits")
         variations.extend(additional_variations)
+
+    # If the observation number is long enough, try removing digits
+    if len(obs_number) > 5:
+        print("Observation number has more than 5 digits. Will also try removing up to 2 digits...")
+        removal_variations = generate_digit_removals(obs_number, 2)
+        print(f"Generated {len(removal_variations)} additional variations by removing digits")
+        variations.extend(removal_variations)
 
     total_variations = len(variations)
     print(f"Generated {total_variations} total possible variations to check")
