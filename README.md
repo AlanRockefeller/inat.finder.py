@@ -152,7 +152,7 @@ This project is available under the GNU Public License 3.0. See the LICENSE file
 - Thanks to the iNaturalist team for providing the API that makes this tool possible
 - Special thanks to all naturalists who contribute their observations to iNaturalist
 - Thanks to Mycota Lab, OMDL and Harte Singer for sequencing so many fungi
-- Thanks to Alisha Millican and Scott Ostuni for suggesting new features
+- Thanks to Alisha Millican, Ryan Peace and Scott Ostuni for suggesting new features
 
 ## Change Log
 
