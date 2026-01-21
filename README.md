@@ -1,8 +1,8 @@
 # inat.finder.py
 
-**Version:** 1.6
+**Version:** 1.7
 **Author:** Alan Rockefeller
-**Release Date:** October 16, 2025
+**Release Date:** January 21, 2026
 
 ## Overview
 
@@ -16,7 +16,7 @@ A Windows .exe is available [here](https://github.com/AlanRockefeller/inat.finde
 
 ## Features
 
-- Search by either genus name or iNaturalist username
+- Search by genus name, iNaturalist username, or iNaturalist project
 - Verifies that the specified genus or username exists before searching
 - Checks if the original observation number already matches the genus or username before searching for variations
 - Generates all possible variations with a configurable number of digits that might be wrong (default: 1) - *Now more robust for multiple digits off!*
@@ -61,7 +61,7 @@ Or just copy the code from Github and paste it into a file named `inat_finder.py
 ## Usage
 
 ```
-python inat_finder.py (--genus <genus> | --user <username>) <observation_number_or_url> [options]
+python inat_finder.py (--genus <genus> | --user <username> | --project <project>) <observation_number_or_url> [options]
 ```
 
 ### Required Arguments
@@ -69,6 +69,7 @@ python inat_finder.py (--genus <genus> | --user <username>) <observation_number_
 - Either:
   - `--genus <genus>`: The genus name to match (e.g., "Amanita")
   - `--user <username>`: The iNaturalist username to match (e.g., "alan_rockefeller") 
+  - `--project <project>`: The iNaturalist project to search within (ID, slug, URL, or title) 
 - `observation_number_or_url`: The potentially mistyped iNaturalist observation number or a complete iNaturalist URL
 
 ### Options
@@ -95,6 +96,12 @@ Use a full iNaturalist URL instead of just an observation number:
 
 ```bash
 python inat_finder.py --genus Cystoderma https://www.inaturalist.org/observations/187067126
+```
+
+Search within a specific project (by ID, slug, or title):
+
+```bash
+python inat_finder.py --project "Coastal and Marine Mycology 2024" 123456789
 ```
 
 Look for a Russula observation with up to 2 digits wrong in the number:
@@ -154,41 +161,3 @@ This project is available under the GNU Public License 3.0. See the LICENSE file
 - Thanks to Mycota Lab, OMDL and Harte Singer for sequencing so many fungi
 - Thanks to Alisha Millican, Ryan Peace and Scott Ostuni for suggesting new features
 
-## Change Log
-
-### Version 1.6 (October 16, 2025)
-- For observation numbers with more than 5 digits, the script now also tries removing one or two digits to find a match.
-
-### Version 1.5 (June 2, 2025)
-- Corrected a significant bug in generating variations for multiple differing digits.
-- Refactored digit addition logic for clarity.
-- Improved progress bar ETA accuracy.
-- Renamed script to `inat_finder.py` for better module handling.
-- Enhanced API error messages.
-- Added a comprehensive unit test suite.
-
-### Version 1.4 (April 1, 2025)
-- Added ability to search by username instead of genus with the new --user flag
-- Modified command-line interface to require either --genus or --user flag
-- Added validation to verify if the specified genus exists in iNaturalist taxonomy
-- Added validation to verify if the specified username exists on iNaturalist
-- Enhanced results display to include creator username for all matches
-- Updated documentation to reflect new search capabilities
-
-### Version 1.3 (March 29, 2025)
-- Increased batch size to 200 observations per API request (maximum allowed)
-- Improved overall execution speed by approximately 85%
-
-### Version 1.2 (March 29, 2025)
-- Added Windows executable
-- Optimized digit addition algorithm
-
-### Version 1.1 (March 29, 2025)
-- Added support for parsing iNaturalist URLs
-- Enhanced detection of observation numbers with missing digits at both ends
-- Added automatic detection of Mushroom Observer numbers (≤5 digits)
-- Improved verbosity control (only shows detailed messages in verbose mode)
-- Fixed edge cases in digit addition logic
-
-### Version 1.0 (March 28, 2025)
-- Initial release

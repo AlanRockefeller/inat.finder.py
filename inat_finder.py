@@ -2,7 +2,7 @@
 """
 iNaturalist Observation Finder
 
-Version 1.6 - By Alan Rockefeller - October 16, 2025
+Version 1.7 - By Alan Rockefeller - January 21, 2026
 
 This script helps find the correct iNaturalist observation number when there are mistyped digits.
 It works by systematically changing digits of the provided observation number and checking if
@@ -17,11 +17,12 @@ Mushroom Observer observation number instead.
 The script can also parse observation numbers directly from iNaturalist URLs.
 
 Usage:
-    python inat.finder.py (--genus <genus> | --user <username>) <observation_number_or_url> [options]
+    python inat_finder.py (--genus <genus> | --user <username> | --project <project>) <observation_number_or_url> [options]
 
 Arguments:
     --genus <genus>         The genus name to match (e.g., "Galerina")
     --user <username>       The iNaturalist username to match (e.g., "alan_rockefeller")
+    --project <project>     The iNaturalist project to search within (ID, slug, URL, or title)
     observation_number_or_url  The potentially mistyped iNaturalist observation number
                                or a complete iNaturalist URL
 
@@ -65,6 +66,7 @@ def parse_arguments():
     group = search_group.add_mutually_exclusive_group(required=True)
     group.add_argument("--genus", help="The genus name to match (e.g., 'Amanita')")
     group.add_argument("--user", help="The iNaturalist username to match")
+    group.add_argument("--project", help="The iNaturalist project to search within (ID, slug, URL, or title)")
     
     parser.add_argument("observation_number", help="The potentially mistyped iNaturalist observation number or URL")
     parser.add_argument("--digits", type=int, default=1,
@@ -274,6 +276,193 @@ def verify_genus_exists(genus):
             print(f"Error verifying genus: Network error or invalid API endpoint - {e}. Check network connection.")
         return False
 
+def parse_project_slug_from_url(project_input):
+    """
+    Extracts the project slug from an iNaturalist project URL.
+    
+    Args:
+        project_input: A string that might be a project URL.
+        
+    Returns:
+        The extracted slug string if found, or None.
+    """
+    # Look for 'projects/' pattern only if the input looks URL-like or mentions iNaturalist
+    if "projects/" in project_input and ("//" in project_input or "inaturalist.org" in project_input):
+        match = re.search(r'projects/([^/?#]+)', project_input)
+        if match:
+            return match.group(1)
+    return None
+
+def search_projects_by_query(query):
+    """
+    Search for projects on iNaturalist by title or slug.
+    
+    Args:
+        query: The search term (title or slug).
+        
+    Returns:
+        A list of project dictionaries containing 'id', 'slug', and 'title'.
+    """
+    try:
+        url = "https://api.inaturalist.org/v1/projects"
+        params = {"q": query, "per_page": 10}
+        response = requests.get(url, params=params, timeout=20)
+        response.raise_for_status()
+        return response.json().get('results', [])
+    except requests.RequestException as e:
+        print(f"Error searching projects: {e}")
+        return []
+
+def resolve_project_identifier(project_input):
+    """
+    Resolves a project input string to a valid project ID/slug and metadata.
+    
+    Args:
+        project_input: The input string (ID, slug, URL, or title).
+        
+    Returns:
+        tuple: (project_id_or_slug, project_metadata_dict)
+        
+    Exits the program if ambiguous or not found.
+    """
+    # 1. Check if it's a numeric ID first
+    if project_input.isdigit():
+        try:
+            url = f"https://api.inaturalist.org/v1/projects/{project_input}"
+            response = requests.get(url, timeout=20)
+            if response.status_code == 200:
+                results = response.json().get('results', [])
+                if results:
+                    return project_input, results[0]
+            
+            # If we are here, the ID was not found or the request failed
+            print(f"Error: Project ID '{project_input}' not found on iNaturalist.")
+            sys.exit(1)
+            
+        except requests.RequestException as e:
+            print(f"Error verifying project ID: {e}")
+            sys.exit(1)
+
+    # 2. Check if it's a URL
+    slug_from_url = parse_project_slug_from_url(project_input)
+    if slug_from_url:
+        # Verify the extracted slug
+        candidates = search_projects_by_query(slug_from_url)
+        for p in candidates:
+            # Case-insensitive comparison
+            if p.get('slug', '').lower() == slug_from_url.lower():
+                return str(p.get("id", slug_from_url)), p
+        print(f"Error: Project URL slug '{slug_from_url}' not found.")
+        sys.exit(1)
+
+    # 3. Determine if it's likely a title or a slug
+    # Conservative slug detection:
+    # - If contains spaces -> Title
+    # - If all digits -> ID (handled above)
+    # - Else -> Treat as Slug candidate, but verify exactly. 
+    #   If verification fails, fallback to title search.
+    
+    is_likely_slug = " " not in project_input
+    
+    candidates = search_projects_by_query(project_input)
+    
+    if not candidates:
+        print(f"Error: Project '{project_input}' not found on iNaturalist.")
+        sys.exit(1)
+
+    # Try to find exact match
+    exact_matches = []
+    for p in candidates:
+        # Check slug match (if it looks like a slug)
+        if is_likely_slug and p.get('slug', '').lower() == project_input.lower():
+            exact_matches.append(p)
+        # Check title match
+        elif p.get('title', '').lower() == project_input.lower():
+            exact_matches.append(p)
+            
+    if len(exact_matches) == 1:
+        p = exact_matches[0]
+        # Prefer ID if available, else slug
+        limit_param = str(p.get('id', p.get('slug')))
+        return limit_param, p
+        
+    if len(exact_matches) > 1:
+        # This shouldn't happen often for slugs, maybe for titles
+        print(f"Found multiple exact matches for '{project_input}':")
+        for p in exact_matches:
+            print(f" - {p.get('title')} (ID: {p.get('id')}, Slug: {p.get('slug')})")
+        print("Please use the specific ID or Slug.")
+        sys.exit(1)
+        
+    # If no exact match, but we have candidates, show disambiguation
+    print(f"No exact match found for '{project_input}', but found similar projects:")
+    for p in candidates[:5]:
+        print(f" - {p.get('title')} (ID: {p.get('id')}, Slug: {p.get('slug')})")
+    print("\nPlease re-run with the specific Project ID or Slug.")
+    sys.exit(1)
+
+def unique_preserve_order(seq):
+    """
+    Deduplicates a list while preserving the original order.
+    """
+    seen = set()
+    result = []
+    for item in seq:
+        if item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+def preprocess_argv_for_project_name(argv):
+    """
+    Pre-processes sys.argv to handle unquoted project names.
+    
+    Example: --project Coastal and Marine Mycology 2024 123456
+    Becomes: --project "Coastal and Marine Mycology 2024" 123456
+    
+    Args:
+        argv: List of command line arguments (usually sys.argv).
+        
+    Returns:
+        Modified list of arguments.
+    """
+    if "--project" not in argv:
+        return argv
+        
+    new_argv = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        new_argv.append(arg)
+        i += 1
+        
+        if arg == "--project":
+            # Start collecting tokens until we hit something that looks like an observation
+            # or another flag
+            project_tokens = []
+            while i < len(argv):
+                next_arg = argv[i]
+                
+                # Stop if it's the observation number/URL
+                # Rule: contains "observations/" OR (digits >= 6)
+                is_obs = "observations/" in next_arg or (next_arg.isdigit() and len(next_arg) >= 6)
+                
+                # Stop if it's a new flag
+                is_flag = next_arg.startswith("-")
+                
+                if is_obs or is_flag:
+                    break
+                    
+                project_tokens.append(next_arg)
+                i += 1
+            
+            # If we collected multiple tokens, join them. 
+            # If just one, it might be quoted or just a slug, effectively same result.
+            if project_tokens:
+                new_argv.append(" ".join(project_tokens))
+    
+    return new_argv
+
 def parse_inat_url(url_or_number):
     """
     Extracts the observation number from an iNaturalist URL.
@@ -304,7 +493,7 @@ def parse_inat_url(url_or_number):
         # If it's not a URL, assume it's already an observation number
         return url_or_number
 
-def batch_check_observations(variations, batch_size=200):
+def batch_check_observations(variations, batch_size=200, project_id=None):
     """
     Check multiple observation IDs by querying the iNaturalist API in batches.
 
@@ -317,6 +506,7 @@ def batch_check_observations(variations, batch_size=200):
     Args:
         variations: A list of observation ID strings to be verified.
         batch_size: Maximum number of observation IDs to include in each API request (default is 200).
+        project_id: Optional project ID or slug to filter by.
 
     Returns:
         A list of observation data dictionaries obtained from the API responses.
@@ -328,10 +518,16 @@ def batch_check_observations(variations, batch_size=200):
         batch = variations[i:i+batch_size]
         ids_string = ",".join(batch)
 
-        url = f"https://api.inaturalist.org/v1/observations?id={ids_string}&per_page={batch_size}"
+        url = "https://api.inaturalist.org/v1/observations"
+        params = {
+            "id": ids_string,
+            "per_page": batch_size
+        }
+        if project_id:
+            params["project_id"] = project_id
 
         try:
-            response = requests.get(url, timeout=20)
+            response = requests.get(url, params=params, timeout=20)
             response.raise_for_status()
             data = response.json()
 
@@ -409,44 +605,69 @@ def main():
 
     This function orchestrates the search for valid iNaturalist observations by:
     - Parsing command-line arguments and extracting an observation number from a URL or plain input.
-    - Verifying that the specified genus or username exists in iNaturalist.
+    - Verifying that the specified genus, username, or project exists in iNaturalist.
     - Validating the observation number and warning the user if it appears too short (suggesting a possible Mushroom Observer observation).
-    - Optionally confirming whether the original observation number already matches the target genus or username.
+    - Optionally confirming whether the original observation number already matches the criteria.
     - Generating possible variations by altering digits and appending additional ones for shorter numbers.
     - Checking these variations in batches via API calls and displaying progress.
     - Presenting a summary of potential matches and the overall search duration.
 
     Note: This function interacts with the user via input prompts and exits if critical validation fails.
     """
+    # Pre-process sys.argv to handle unquoted project names
+    sys.argv = preprocess_argv_for_project_name(sys.argv)
+    
     batch_size = 200  # Define batch size as a constant
 
     args = parse_arguments()
 
     genus = args.genus
     username = args.user
+    project_input = args.project
     obs_input = args.observation_number
     digits_off = args.digits
     verbose = args.verbose
     show_progress = not args.no_progress
 
     # Determine search mode
-    search_mode = "genus" if genus else "user"
-    search_term = genus if search_mode == "genus" else username
+    if genus:
+        search_mode = "genus"
+        search_term = genus
+    elif username:
+        search_mode = "user"
+        search_term = username
+    else:
+        search_mode = "project"
+        search_term = project_input
 
-    # Verify that the genus or user exists before proceeding
+    project_id_param = None
+    project_metadata = None
+
+    # Verify that the genus, user, or project exists before proceeding
     print(f"Verifying {search_mode} '{search_term}' exists on iNaturalist...")
+    
     if search_mode == "genus":
         if not verify_genus_exists(genus):
             print(f"Error: Genus '{genus}' not found in iNaturalist taxonomy.")
             print("Please check the spelling or try a different genus name.")
             sys.exit(1)
         print(f"✓ Genus '{genus}' verified in iNaturalist taxonomy.")
-    else:  # User mode
+        
+    elif search_mode == "user":
         if not verify_user_exists(username):
             print(f"Error: Username '{username}' not found on iNaturalist.")
             print("Please check the spelling or try a different username.")
             sys.exit(1)
         print(f"✓ Username '{username}' verified on iNaturalist.")
+        
+    elif search_mode == "project":
+        project_id_param, project_metadata = resolve_project_identifier(project_input)
+        title = project_metadata.get('title', 'Unknown Project')
+        pid = project_metadata.get('id')
+        slug = project_metadata.get('slug')
+        print(f"✓ Project verified: {title} (ID: {pid}, Slug: {slug})")
+        if slug:
+            print(f"  Project URL: https://www.inaturalist.org/projects/{slug}")
 
     # Parse URL if provided
     obs_number = parse_inat_url(obs_input)
@@ -477,19 +698,28 @@ def main():
         print(f"Checking if original observation number {obs_number} matches {search_mode} '{search_term}'...")
 
     # Make a single API call to check the original number
-    original_check = batch_check_observations([obs_number], 1)
+    original_check = batch_check_observations([obs_number], 1, project_id=project_id_param)
+    
+    # In project mode, if we get results passing project_id param, they are matches.
+    # In other modes, we need to check check_observation_* functions.
+    
     if original_check:
         match_found = False
-        if search_mode == "genus" and check_observation_genus(original_check[0], genus):
+        obs = original_check[0]
+        
+        if search_mode == "project":
+            match_found = True
+            print(f"✓ Good news! The original observation number {obs_number} is in project '{project_metadata.get('title')}'.")
+        elif search_mode == "genus" and check_observation_genus(obs, genus):
             match_found = True
             print(f"✓ Good news! The original observation number {obs_number} already matches genus {genus}.")
-            print(f"  Taxon: {original_check[0].get('taxon', {}).get('name', 'Unknown taxon')}")
-        elif search_mode == "user" and check_observation_user(original_check[0], username):
+        elif search_mode == "user" and check_observation_user(obs, username):
             match_found = True
             print(f"✓ Good news! The original observation number {obs_number} was created by user {username}.")
-            print(f"  Taxon: {original_check[0].get('taxon', {}).get('name', 'Unknown taxon')}")
         
         if match_found:
+            print(f"  Taxon: {obs.get('taxon', {}).get('name', 'Unknown taxon')}")
+            print(f"  Creator: {obs.get('user', {}).get('login', 'Unknown user')}")
             print(f"  URL: https://www.inaturalist.org/observations/{obs_number}")
             user_input = input("Continue searching for other potential matches? (y/n): ").strip().lower()
             if user_input != 'y':
@@ -498,8 +728,10 @@ def main():
 
     if search_mode == "genus":
         print(f"Looking for iNaturalist observations with genus '{genus}' that might be {digits_off} digit(s) off from '{obs_number}'")
-    else:
+    elif search_mode == "user":
         print(f"Looking for iNaturalist observations created by user '{username}' that might be {digits_off} digit(s) off from '{obs_number}'")
+    else:
+        print(f"Looking for iNaturalist observations in project '{project_metadata.get('title')}' that might be {digits_off} digit(s) off from '{obs_number}'")
 
     # Generate all possible variations with specified digits changed
     variations = generate_digit_variations(obs_number, digits_off)
@@ -519,8 +751,10 @@ def main():
         print(f"Generated {len(removal_variations)} additional variations by removing digits")
         variations.extend(removal_variations)
 
+    # Deduplicate variations while preserving order
+    variations = unique_preserve_order(variations)
     total_variations = len(variations)
-    print(f"Generated {total_variations} total possible variations to check")
+    print(f"Generated {total_variations} total unique variations to check")
 
     # Set up progress bar if requested
     pbar = None
@@ -538,13 +772,13 @@ def main():
 
     for i in range(0, len(variations), batch_size):
         batch = variations[i:i+batch_size]
-
+        
         if verbose:
             print(f"\nChecking batch of {len(batch)} variations ({i+1}-{min(i+batch_size, total_variations)} of {total_variations})")
             print(f"Variations in this batch: {', '.join(batch)}")
 
         batch_start_time = time.time()
-        results = batch_check_observations(batch, batch_size)
+        results = batch_check_observations(batch, batch_size, project_id=project_id_param)
         batch_end_time = time.time()
 
         current_batch_time = batch_end_time - batch_start_time
@@ -558,13 +792,7 @@ def main():
                 remaining_items = total_variations - pbar.n - len(batch) # pbar.n is updated after pbar.update()
                 if remaining_items < 0: remaining_items = 0 # Ensure non-negative
                 
-                # Estimate remaining batches carefully, especially if batch_size is not a perfect divisor
-                # The number of batches already processed is (pbar.n + len(batch)) / batch_size
-                # Total batches approx total_variations / batch_size
-                # Remaining batches = total_batches - processed_batches
-                # A simpler way: remaining_items / batch_size
                 remaining_batches = remaining_items / batch_size
-                
                 estimated_remaining_time = average_batch_time * remaining_batches
                 pbar.set_postfix({"ETA": str(timedelta(seconds=int(estimated_remaining_time)))})
 
@@ -572,25 +800,31 @@ def main():
             obs_id = obs.get('id')
             match_found = False
             
-            if search_mode == "genus" and check_observation_genus(obs, genus):
+            if search_mode == "project":
+                # Server side filtering has already ensured membership
+                match_found = True
+                matches.append(obs)
+                if verbose:
+                    print(f"✓ Match found: Observation {obs_id} is in project")
+            elif search_mode == "genus" and check_observation_genus(obs, genus):
                 match_found = True
                 matches.append(obs)
                 if verbose:
                     print(f"✓ Match found: Observation {obs_id} has genus {genus}")
-                    if 'taxon' in obs and 'name' in obs['taxon']:
-                        print(f"  Taxon: {obs['taxon']['name']}")
             elif search_mode == "user" and check_observation_user(obs, username):
                 match_found = True
                 matches.append(obs)
                 if verbose:
                     print(f"✓ Match found: Observation {obs_id} was created by user {username}")
-                    if 'taxon' in obs and 'name' in obs['taxon']:
-                        print(f"  Taxon: {obs['taxon']['name']}")
+            
+            if match_found and verbose:
+                if 'taxon' in obs and 'name' in obs['taxon']:
+                    print(f"  Taxon: {obs['taxon']['name']}")
                         
             if not match_found and verbose:
                 if search_mode == "genus":
                     print(f"✗ Observation {obs_id} does not match genus {genus}")
-                else:
+                elif search_mode == "user":
                     print(f"✗ Observation {obs_id} was not created by user {username}")
 
         # Update progress bar
@@ -616,8 +850,11 @@ def main():
         print("1. The observation may have more than one digit mistyped")
         if search_mode == "genus":
             print("2. The genus name might be incorrect")
-        else:
+        elif search_mode == "user":
             print("2. The username might be incorrect")
+        elif search_mode == "project":
+            print("2. The project might be incorrect (try ID instead of slug/title)")
+            
         print("3. The observation might not exist or has been removed")
         if len(obs_number) <= 5:
             print("4. This might be a Mushroom Observer number: https://mushroomobserver.org/" + obs_number)
