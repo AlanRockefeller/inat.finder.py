@@ -1,8 +1,8 @@
 # inat.finder.py
 
-**Version:** 1.6
+**Version:** 1.7
 **Author:** Alan Rockefeller
-**Release Date:** October 16, 2025
+**Release Date:** January 21, 2026
 
 ## Overview
 
@@ -16,7 +16,7 @@ A Windows .exe is available [here](https://github.com/AlanRockefeller/inat.finde
 
 ## Features
 
-- Search by either genus name or iNaturalist username
+- Search by genus name, iNaturalist username, or iNaturalist project
 - Verifies that the specified genus or username exists before searching
 - Checks if the original observation number already matches the genus or username before searching for variations
 - Generates all possible variations with a configurable number of digits that might be wrong (default: 1) - *Now more robust for multiple digits off!*
@@ -61,7 +61,7 @@ Or just copy the code from Github and paste it into a file named `inat_finder.py
 ## Usage
 
 ```
-python inat_finder.py (--genus <genus> | --user <username>) <observation_number_or_url> [options]
+python inat_finder.py (--genus <genus> | --user <username> | --project <project>) <observation_number_or_url> [options]
 ```
 
 ### Required Arguments
@@ -69,6 +69,7 @@ python inat_finder.py (--genus <genus> | --user <username>) <observation_number_
 - Either:
   - `--genus <genus>`: The genus name to match (e.g., "Amanita")
   - `--user <username>`: The iNaturalist username to match (e.g., "alan_rockefeller") 
+  - `--project <project>`: The iNaturalist project to search within (ID, slug, URL, or title) 
 - `observation_number_or_url`: The potentially mistyped iNaturalist observation number or a complete iNaturalist URL
 
 ### Options
@@ -95,6 +96,12 @@ Use a full iNaturalist URL instead of just an observation number:
 
 ```bash
 python inat_finder.py --genus Cystoderma https://www.inaturalist.org/observations/187067126
+```
+
+Search within a specific project (by ID, slug, or title):
+
+```bash
+python inat_finder.py --project "Coastal and Marine Mycology 2024" 123456789
 ```
 
 Look for a Russula observation with up to 2 digits wrong in the number:

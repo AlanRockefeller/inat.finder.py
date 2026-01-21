@@ -1,6 +1,12 @@
 # Changelog
 All notable changes to the inat.finder.py project will be documented in this file.
 
+## [1.7] - 2026-01-21
+### Added
+- New `--project` argument to search within a specific iNaturalist project (ID, slug, URL, or title).
+- Robust project verification and disambiguation logic.
+- Support for unquoted multi-word project titles in the command line.
+
 ## [1.6] - 2025-10-16
 ### Added
 - For observation numbers with more than 5 digits, the script now also tries removing one or two digits to find a match.  Thanks to Ryan Peace for the suggestion!
