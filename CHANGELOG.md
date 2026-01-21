@@ -3,7 +3,7 @@ All notable changes to the inat.finder.py project will be documented in this fil
 
 ## [1.7] - 2026-01-21
 ### Added
-- New `--project` argument to search within a specific iNaturalist project (ID, slug, URL, or title).
+- New `--project` argument to search within a specific iNaturalist project (ID, slug, URL, or title).   (Thanks to Ryan Peace for the suggestion!)
 - Robust project verification and disambiguation logic.
 - Support for unquoted multi-word project titles in the command line.
 
