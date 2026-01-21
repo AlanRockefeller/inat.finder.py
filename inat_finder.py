@@ -156,12 +156,10 @@ def generate_digit_additions(number_str, max_added_digits=2):
     variations = []
 
     # Add single digits at the beginning only (0-9)
-    for digit in range(10):
-        variations.append(str(digit) + number_str)
+    variations.extend([str(digit) + number_str for digit in range(10)])
 
     # Add single digits at the end only (0-9)
-    for digit in range(10):
-        variations.append(number_str + str(digit))
+    variations.extend([number_str + str(digit) for digit in range(10)])
 
     # If max_added_digits is 2, add two digits
     if max_added_digits >= 2:
@@ -230,7 +228,7 @@ def verify_user_exists(username):
         data = response.json()
         
         # Check if any user matches the exact username
-        if 'results' in data and data['results']:
+        if data.get('results'):
             for user in data['results']:
                 if user.get('login', '').lower() == username.lower():
                     return True
@@ -262,10 +260,12 @@ def verify_genus_exists(genus):
         data = response.json()
         
         # Check if any taxon matches the exact genus name and is of rank genus
-        if 'results' in data and data['results']:
+        if data.get('results'):
             for taxon in data['results']:
-                if (taxon.get('name', '').lower() == genus.lower() and 
-                    taxon.get('rank', '') == 'genus'):
+                if (
+                    taxon.get('name', '').lower() == genus.lower() and 
+                    taxon.get('rank', '') == 'genus'
+                ):
                     return True
         
         return False
@@ -371,15 +371,14 @@ def resolve_project_identifier(project_input):
         sys.exit(1)
 
     # Try to find exact match
-    exact_matches = []
-    for p in candidates:
-        # Check slug match (if it looks like a slug)
-        if is_likely_slug and p.get('slug', '').lower() == project_input.lower():
-            exact_matches.append(p)
-        # Check title match
-        elif p.get('title', '').lower() == project_input.lower():
-            exact_matches.append(p)
-            
+    project_input_lower = project_input.lower()
+    exact_matches = [
+        p
+        for p in candidates
+        if (is_likely_slug and p.get("slug", "").lower() == project_input_lower)
+        or p.get("title", "").lower() == project_input_lower
+    ]
+
     if len(exact_matches) == 1:
         p = exact_matches[0]
         # Prefer ID if available, else slug
@@ -562,7 +561,7 @@ def check_observation_genus(observation, target_genus):
         taxon = observation['taxon']
         if taxon and 'ancestry' in taxon:
             # Check genus information from the taxonomy
-            for ancestor in taxon['ancestors'] if 'ancestors' in taxon else []:
+            for ancestor in taxon.get('ancestors', []):
                 if ancestor.get('rank') == 'genus' and ancestor.get('name', '').lower() == target_genus.lower():
                     return True
 
@@ -790,7 +789,8 @@ def main():
             average_batch_time = sum(batch_times) / len(batch_times)
             if average_batch_time > 0: # Avoid division by zero if a batch was instant
                 remaining_items = total_variations - pbar.n - len(batch) # pbar.n is updated after pbar.update()
-                if remaining_items < 0: remaining_items = 0 # Ensure non-negative
+                if remaining_items < 0:
+                    remaining_items = 0 # Ensure non-negative
                 
                 remaining_batches = remaining_items / batch_size
                 estimated_remaining_time = average_batch_time * remaining_batches
@@ -817,9 +817,9 @@ def main():
                 if verbose:
                     print(f"✓ Match found: Observation {obs_id} was created by user {username}")
             
-            if match_found and verbose:
-                if 'taxon' in obs and 'name' in obs['taxon']:
-                    print(f"  Taxon: {obs['taxon']['name']}")
+            taxon_name = obs.get("taxon", {}).get("name")
+            if match_found and verbose and taxon_name:
+                print(f"  Taxon: {taxon_name}")
                         
             if not match_found and verbose:
                 if search_mode == "genus":
@@ -863,3 +863,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
