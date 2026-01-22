@@ -669,14 +669,20 @@ def get_user_confirmation(prompt, default_yes=False):
         bool: True if user confirms, False otherwise
     """
     while True:
-        response = input(prompt).strip().lower()
+        try:
+            response = input(prompt)
+        except EOFError:
+            # Non-interactive stdin / no input available: fall back to default
+            return default_yes
+
+        response = response.strip().lower()
 
         if not response:
             return default_yes
 
         if response in ("y", "yes"):
             return True
-        elif response in ("n", "no"):
+        if response in ("n", "no"):
             return False
         else:
             print("Please enter 'y' or 'n'")
