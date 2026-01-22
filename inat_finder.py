@@ -603,8 +603,8 @@ def check_observation_genus(observation, target_genus):
         return False
 
     # Check ancestors list if it exists
-    if "ancestors" in taxon:
-        for ancestor in taxon["ancestors"]:
+    for ancestor in (taxon.get("ancestors") or []):
+        if isinstance(ancestor, dict):
             if (
                 ancestor.get("rank") == "genus"
                 and ancestor.get("name", "").lower() == target_genus.lower()
@@ -643,14 +643,16 @@ def check_observation_user(observation, target_username):
     Returns:
         True if the observation was created by the target user; otherwise, False.
     """
-    if observation and "user" in observation:
-        user = observation["user"]
-        if (
-            user
-            and "login" in user
-            and user["login"].lower() == target_username.lower()
-        ):
-            return True
+    if not observation:
+        return False
+
+    user = observation.get("user") or {}
+    if not isinstance(user, dict):
+        return False
+
+    login = user.get("login")
+    if login and isinstance(login, str):
+        return login.lower() == target_username.lower()
 
     return False
 
