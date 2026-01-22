@@ -2,7 +2,7 @@
 """
 iNaturalist Observation Finder
 
-Version 1.7 - By Alan Rockefeller - January 21, 2026
+Version 1.7.1 - By Alan Rockefeller - January 21, 2026 (Bug Fixes)
 
 This script helps find the correct iNaturalist observation number when there are mistyped digits.
 It works by systematically changing digits of the provided observation number and checking if
@@ -603,7 +603,7 @@ def check_observation_genus(observation, target_genus):
         return False
 
     # Check ancestors list if it exists
-    for ancestor in (taxon.get("ancestors") or []):
+    for ancestor in taxon.get("ancestors") or []:
         if isinstance(ancestor, dict):
             if (
                 ancestor.get("rank") == "genus"
@@ -655,6 +655,37 @@ def check_observation_user(observation, target_username):
         return login.lower() == target_username.lower()
 
     return False
+
+
+def get_user_confirmation(prompt, default_yes=False):
+    """
+    Get yes/no confirmation from user with better input handling.
+
+    Args:
+        prompt: The question to ask the user
+        default_yes: If True, empty input defaults to 'yes'
+
+    Returns:
+        bool: True if user confirms, False otherwise
+    """
+    while True:
+        try:
+            response = input(prompt)
+        except EOFError:
+            # Non-interactive stdin / no input available: fall back to default
+            return default_yes
+
+        response = response.strip().lower()
+
+        if not response:
+            return default_yes
+
+        if response in ("y", "yes"):
+            return True
+        if response in ("n", "no"):
+            return False
+        else:
+            print("Please enter 'y' or 'n'")
 
 
 def main():
@@ -748,10 +779,9 @@ def main():
         print("This might be a Mushroom Observer observation rather than iNaturalist.")
         print(f"Consider checking: https://mushroomobserver.org/{obs_number}")
 
-        user_input = (
-            input("Continue with iNaturalist search anyway? (y/n): ").strip().lower()
-        )
-        if user_input != "y":
+        if not get_user_confirmation(
+            "Continue with iNaturalist search anyway? (y/n): "
+        ):
             print("Exiting search.")
             return
 
@@ -793,12 +823,9 @@ def main():
             print(f"  Taxon: {(obs.get('taxon') or {}).get('name', 'Unknown taxon')}")
             print(f"  Creator: {(obs.get('user') or {}).get('login', 'Unknown user')}")
             print(f"  URL: https://www.inaturalist.org/observations/{obs_number}")
-            user_input = (
-                input("Continue searching for other potential matches? (y/n): ")
-                .strip()
-                .lower()
-            )
-            if user_input != "y":
+            if not get_user_confirmation(
+                "Continue searching for other potential matches? (y/n): "
+            ):
                 print("Exiting search.")
                 return
 
@@ -846,6 +873,10 @@ def main():
     total_variations = len(variations)
     print(f"Generated {total_variations} total unique variations to check")
 
+    if total_variations == 0:
+        print("Error: No variations could be generated from the observation number.")
+        sys.exit(1)
+
     # Set up progress bar if requested
     pbar = None
     start_time = time.time()
@@ -865,7 +896,7 @@ def main():
 
         if verbose:
             print(
-                f"\nChecking batch of {len(batch)} variations ({i+1}-{min(i+batch_size, total_variations)} of {total_variations})"
+                f"\nChecking batch of {len(batch)} variations ({i + 1}-{min(i + batch_size, total_variations)} of {total_variations})"
             )
             print(f"Variations in this batch: {', '.join(batch)}")
 
@@ -880,12 +911,15 @@ def main():
         if len(batch_times) > max_batch_times_to_average:
             batch_times.pop(0)  # Keep only the last N times
 
+        # Update progress bar
         if show_progress and pbar:
+            pbar.update(len(batch))
+            
             average_batch_time = sum(batch_times) / len(batch_times)
-            if average_batch_time > 0:  # Avoid division by zero if a batch was instant
+            if average_batch_time > 0 and batch_size > 0:
                 remaining_items = (
-                    total_variations - pbar.n - len(batch)
-                )  # pbar.n is updated after pbar.update()
+                    total_variations - pbar.n
+                )
                 if remaining_items < 0:
                     remaining_items = 0  # Ensure non-negative
 
@@ -927,10 +961,6 @@ def main():
                     print(f"✗ Observation {obs_id} does not match genus {genus}")
                 elif search_mode == "user":
                     print(f"✗ Observation {obs_id} was not created by user {username}")
-
-        # Update progress bar
-        if show_progress and pbar:
-            pbar.update(len(batch))
 
     if show_progress and pbar:
         pbar.close()
