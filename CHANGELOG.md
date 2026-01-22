@@ -1,6 +1,16 @@
 # Changelog
 All notable changes to the inat.finder.py project will be documented in this file.
 
+## [1.7.1] - 2026-01-21
+### Fixed
+- Fixed crash when API returns `None` for `taxon` or `user` fields.
+- Improved robustness of `check_observation_genus` and `check_observation_user` against unexpected data types.
+- Corrected inaccurate ETA calculation in the progress bar.
+- Improved user input handling to robustly accept various yes/no responses.
+- Added validation to prevent errors when no variations are generated.
+- Fixed potential division by zero error in ETA calculation.
+- Optimized rate limiting to skip unnecessary sleep after the final batch.
+
 ## [1.7] - 2026-01-21
 ### Added
 - New `--project` argument to search within a specific iNaturalist project (ID, slug, URL, or title).   (Thanks to Ryan Peace for the suggestion!)

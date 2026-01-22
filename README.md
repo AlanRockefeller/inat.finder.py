@@ -1,6 +1,6 @@
 # inat.finder.py
 
-**Version:** 1.7
+**Version:** 1.7.1
 **Author:** Alan Rockefeller
 **Release Date:** January 21, 2026
 
