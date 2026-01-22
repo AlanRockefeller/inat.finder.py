@@ -573,7 +573,8 @@ def batch_check_observations(variations, batch_size=200, project_id=None):
             print(f"Error fetching batch: {e}")
 
         # Rate limiting - no more than 1 request per second
-        time.sleep(1)
+        if i + batch_size < len(variations):
+            time.sleep(1)
 
     return all_results
 
