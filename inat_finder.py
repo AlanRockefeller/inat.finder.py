@@ -2,7 +2,7 @@
 """
 iNaturalist Observation Finder
 
-Version 1.7.1 - By Alan Rockefeller - January 21, 2026 (Bug Fixes)
+Version 1.7.2 - By Alan Rockefeller - June 4, 2026
 
 This script helps find the correct iNaturalist observation number when there are mistyped digits.
 It works by systematically changing digits of the provided observation number and checking if
@@ -478,9 +478,9 @@ def preprocess_argv_for_project_name(argv):
                 next_arg = argv[i]
 
                 # Stop if it's the observation number/URL
-                # Rule: contains "observations/" OR (digits >= 6)
+                # Rule: contains "observations/" OR (digits >= 5)
                 is_obs = "observations/" in next_arg or (
-                    next_arg.isdigit() and len(next_arg) >= 6
+                    next_arg.isdigit() and len(next_arg) >= 5
                 )
 
                 # Stop if it's a new flag
@@ -914,12 +914,10 @@ def main():
         # Update progress bar
         if show_progress and pbar:
             pbar.update(len(batch))
-            
+
             average_batch_time = sum(batch_times) / len(batch_times)
             if average_batch_time > 0 and batch_size > 0:
-                remaining_items = (
-                    total_variations - pbar.n
-                )
+                remaining_items = total_variations - pbar.n
                 if remaining_items < 0:
                     remaining_items = 0  # Ensure non-negative
 
@@ -961,6 +959,10 @@ def main():
                     print(f"✗ Observation {obs_id} does not match genus {genus}")
                 elif search_mode == "user":
                     print(f"✗ Observation {obs_id} was not created by user {username}")
+
+        # Rate limiting - no more than 1 request per second
+        if i + batch_size < len(variations):
+            time.sleep(1)
 
     if show_progress and pbar:
         pbar.close()

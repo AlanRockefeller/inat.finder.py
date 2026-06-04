@@ -1,5 +1,14 @@
 import unittest
-from inat_finder import generate_digit_variations, generate_digit_additions, parse_inat_url, generate_digit_removals
+from unittest.mock import patch
+
+import inat_finder
+from inat_finder import (
+    generate_digit_additions,
+    generate_digit_removals,
+    generate_digit_variations,
+    parse_inat_url,
+    preprocess_argv_for_project_name,
+)
 
 class TestInatFinderFunctions(unittest.TestCase):
     # Test methods for generate_digit_variations
@@ -179,6 +188,34 @@ class TestInatFinderFunctions(unittest.TestCase):
         self.assertEqual(parse_inat_url("https://www.inaturalist.org/observations/abc"), "https://www.inaturalist.org/observations/abc")
         self.assertEqual(parse_inat_url("https://www.inaturalist.org/observations/"), "https://www.inaturalist.org/observations/")
 
+    def test_project_preprocess_preserves_five_digit_observation_id(self):
+        argv = ["inat_finder.py", "--project", "my-slug", "12345"]
+        self.assertEqual(
+            preprocess_argv_for_project_name(argv),
+            ["inat_finder.py", "--project", "my-slug", "12345"],
+        )
+
+    def test_project_preprocess_keeps_year_in_unquoted_project_name(self):
+        argv = [
+            "inat_finder.py",
+            "--project",
+            "Coastal",
+            "and",
+            "Marine",
+            "Mycology",
+            "2024",
+            "12345",
+        ]
+        self.assertEqual(
+            preprocess_argv_for_project_name(argv),
+            [
+                "inat_finder.py",
+                "--project",
+                "Coastal and Marine Mycology 2024",
+                "12345",
+            ],
+        )
+
     # Test methods for generate_digit_removals
     def test_gdr_remove_one(self):
         variations = generate_digit_removals("123", max_removed_digits=1)
@@ -203,6 +240,31 @@ class TestInatFinderFunctions(unittest.TestCase):
         self.assertEqual(generate_digit_removals("1", 2), [])
         self.assertEqual(generate_digit_removals("1", 1), [])
         self.assertCountEqual(generate_digit_removals("12", 2), ["1", "2"])
+
+    def test_main_sleeps_between_outer_variation_batches(self):
+        argv = [
+            "inat_finder.py",
+            "--genus",
+            "Amanita",
+            "123456789",
+            "--digits",
+            "2",
+            "--no-progress",
+        ]
+        with (
+            patch.object(inat_finder.sys, "argv", argv),
+            patch.object(inat_finder, "verify_genus_exists", return_value=True),
+            patch.object(inat_finder, "batch_check_observations", return_value=[])
+            as batch_check,
+            patch.object(inat_finder.time, "sleep") as sleep,
+            patch("builtins.print"),
+        ):
+            inat_finder.main()
+
+        variation_batch_calls = batch_check.call_args_list[1:]
+        self.assertGreater(len(variation_batch_calls), 1)
+        self.assertEqual(sleep.call_count, len(variation_batch_calls) - 1)
+        sleep.assert_any_call(1)
 
 
 if __name__ == '__main__':
