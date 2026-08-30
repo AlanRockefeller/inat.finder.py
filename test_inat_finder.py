@@ -41,17 +41,13 @@ class TestInatFinderFunctions(unittest.TestCase):
                 self.assertIn(str(i), variations_single)
 
     def test_gdv_multiple_digits_off(self):
-        # Test case for digits_off > 1
-        # For "12", digits_off=2.
-        # Each position must change.
+        # For "12", digits_off=2 includes one- and two-digit changes.
         # Pos 0 (was '1') can be any of 9 digits (0, 2-9)
         # Pos 1 (was '2') can be any of 9 digits (0, 1, 3-9)
-        # Total variations = 9 * 9 = 81
+        # Total variations = (2 * 9) + (9 * 9) = 99
         variations = generate_digit_variations("12", 2)
-        self.assertEqual(
-            len(set(variations)), 81
-        )  # Function returns a list from a set, so it's unique
-        self.assertEqual(len(variations), 81)
+        self.assertEqual(len(set(variations)), 99)
+        self.assertEqual(len(variations), 99)
 
         # Specific checks:
         self.assertIn("00", variations)  # 1->0, 2->0
@@ -59,27 +55,30 @@ class TestInatFinderFunctions(unittest.TestCase):
         self.assertIn("20", variations)  # 1->2, 2->0
         self.assertIn("98", variations)  # 1->9, 2->8
         self.assertNotIn("12", variations)  # Original
-        self.assertNotIn("02", variations)  # Only one digit changed from "12"
-        self.assertNotIn("10", variations)  # Only one digit changed from "12"
+        self.assertIn("02", variations)  # One digit changed from "12"
+        self.assertIn("10", variations)  # One digit changed from "12"
 
         # For "123", digits_off=2
         # Combinations of 2 positions to change: (0,1), (0,2), (1,2)
         # For (0,1) changing, '1' and '2' change, '3' stays: 9*9*1 = 81 variations (e.g., "003")
         # For (0,2) changing, '1' and '3' change, '2' stays: 9*9*1 = 81 variations (e.g., "020")
         # For (1,2) changing, '2' and '3' change, '1' stays: 9*9*1 = 81 variations (e.g., "100")
-        # Total = 81 + 81 + 81 = 243
+        # Two-digit changes total 81 + 81 + 81 = 243, plus 27 one-digit changes.
         variations_123_2_off = generate_digit_variations("123", 2)
-        self.assertEqual(len(variations_123_2_off), 243)
+        self.assertEqual(len(variations_123_2_off), 270)
         self.assertIn("003", variations_123_2_off)  # 1->0, 2->0, 3 stays
         self.assertIn("020", variations_123_2_off)  # 1->0, 3->0, 2 stays
         self.assertIn("100", variations_123_2_off)  # 2->0, 3->0, 1 stays
         self.assertNotIn("123", variations_123_2_off)  # Original
-        self.assertNotIn("023", variations_123_2_off)  # Only 1 digit changed
-        self.assertNotIn("120", variations_123_2_off)  # Only 1 digit changed
+        self.assertIn("023", variations_123_2_off)  # Only 1 digit changed
+        self.assertIn("120", variations_123_2_off)  # Only 1 digit changed
+
+    def test_gdv_includes_fewer_changes_than_maximum(self):
+        variations = generate_digit_variations("395286405", 3)
+        self.assertIn("395286406", variations)
 
     def test_gdv_uniqueness(self):
-        # The function uses a set internally, so uniqueness is expected.
-        # This test is more of a confirmation.
+        # Variations with different changed-position sets should remain unique.
         variations = generate_digit_variations(
             "111", 1
         )  # Should be "011", "211", ..., "101", "121", ...

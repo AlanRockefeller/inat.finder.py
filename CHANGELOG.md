@@ -2,6 +2,12 @@
 
 All notable changes to the inat.finder.py project will be documented in this file.
 
+## [1.7.3] - 2026-08-29
+
+### Fixed
+
+- Make `--digits N` search observations with one through N changed digits, matching its documented "up to N" behavior.
+
 ## [1.7.2] - 2026-06-04
 
 ### Fixed
