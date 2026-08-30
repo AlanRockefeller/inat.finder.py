@@ -2,7 +2,7 @@
 """
 iNaturalist Observation Finder
 
-Version 1.7.2 - By Alan Rockefeller - June 4, 2026
+Version 1.7.3 - By Alan Rockefeller - August 29, 2026
 
 This script helps find the correct iNaturalist observation number when there are mistyped digits.
 It works by systematically changing digits of the provided observation number and checking if
@@ -80,7 +80,7 @@ def parse_arguments():
         "--digits",
         type=int,
         default=1,
-        help="Number of digits that might be wrong (default: 1)",
+        help="Maximum number of digits that might be wrong (default: 1)",
     )
     parser.add_argument(
         "--verbose",
@@ -105,16 +105,15 @@ def parse_arguments():
 
 def generate_digit_variations(number_str, digits_off=1):
     """
-    Generate variations of an observation number by altering specified digits.
+    Generate variations by altering up to a specified number of digits.
 
-    This function produces unique variations of the input observation number by replacing a given
-    number of digits. For a single-digit change, it iterates over each digit position and substitutes
-    it with every other possible digit. For multiple-digit changes, it recursively generates all combinations.
-    If the 'digits_off' parameter is non-positive, the function returns the original number.
+    This function produces unique variations of the input observation number by
+    replacing between one and ``digits_off`` digits. If ``digits_off`` is
+    non-positive, the function returns the original number.
 
     Args:
         number_str (str): The original observation number.
-        digits_off (int, optional): The number of digits to change. Defaults to 1.
+        digits_off (int, optional): The maximum number of digits to change. Defaults to 1.
 
     Returns:
         List[str]: A list of unique observation number variations.
@@ -122,40 +121,22 @@ def generate_digit_variations(number_str, digits_off=1):
     if digits_off <= 0:
         return [number_str]  # No variations if digits_off is 0 or negative
 
-    # For single digit variation, use direct approach
-    if digits_off == 1:
-        variations = []
-        for pos in range(len(number_str)):
-            for digit in range(10):
-                if int(number_str[pos]) == digit:
-                    continue  # Skip if it's the same digit
-
-                # Replace digit at position pos
-                new_number = number_str[:pos] + str(digit) + number_str[pos + 1 :]
-                variations.append(new_number)
-        return variations
-
-    # For multiple digits off, use itertools.combinations and itertools.product
-    variations_set = set()
+    variations = []
     n = len(number_str)
 
-    for indices in itertools.combinations(range(n), digits_off):
-        # For each combination of positions, generate all possible replacement digits
-        # for those positions
-        for new_digits_tuple in itertools.product(range(10), repeat=digits_off):
-            temp_list = list(number_str)
-            valid_replacement = True
-            for i, index_to_change in enumerate(indices):
-                # Ensure the new digit is different from the original digit at this position
-                if int(number_str[index_to_change]) == new_digits_tuple[i]:
-                    valid_replacement = False
-                    break
-                temp_list[index_to_change] = str(new_digits_tuple[i])
+    for num_changes in range(1, min(digits_off, n) + 1):
+        for indices in itertools.combinations(range(n), num_changes):
+            replacement_options = [
+                [str(digit) for digit in range(10) if str(digit) != number_str[index]]
+                for index in indices
+            ]
+            for replacements in itertools.product(*replacement_options):
+                candidate = list(number_str)
+                for index, replacement in zip(indices, replacements):
+                    candidate[index] = replacement
+                variations.append("".join(candidate))
 
-            if valid_replacement:
-                variations_set.add("".join(temp_list))
-
-    return list(variations_set)
+    return variations
 
 
 def generate_digit_additions(number_str, max_added_digits=2):
@@ -831,18 +812,18 @@ def main():
 
     if search_mode == "genus":
         print(
-            f"Looking for iNaturalist observations with genus '{genus}' that might be {digits_off} digit(s) off from '{obs_number}'"
+            f"Looking for iNaturalist observations with genus '{genus}' that might be up to {digits_off} digit(s) off from '{obs_number}'"
         )
     elif search_mode == "user":
         print(
-            f"Looking for iNaturalist observations created by user '{username}' that might be {digits_off} digit(s) off from '{obs_number}'"
+            f"Looking for iNaturalist observations created by user '{username}' that might be up to {digits_off} digit(s) off from '{obs_number}'"
         )
     else:
         print(
-            f"Looking for iNaturalist observations in project '{project_metadata.get('title')}' that might be {digits_off} digit(s) off from '{obs_number}'"
+            f"Looking for iNaturalist observations in project '{project_metadata.get('title')}' that might be up to {digits_off} digit(s) off from '{obs_number}'"
         )
 
-    # Generate all possible variations with specified digits changed
+    # Generate all possible variations with up to the specified number of digits changed
     variations = generate_digit_variations(obs_number, digits_off)
 
     # If the observation number has fewer than 9 digits, try adding digits
