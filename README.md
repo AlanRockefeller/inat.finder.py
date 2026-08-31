@@ -1,6 +1,6 @@
 # inat.finder.py
 
-**Version:** 1.8.0
+**Version:** 1.7.5
 **Author:** Alan Rockefeller
 **Release Date:** August 30, 2026
 
@@ -16,7 +16,8 @@ A Windows .exe is available [here](https://github.com/AlanRockefeller/inat.finde
 
 ## Features
 
-- Search by genus name, family name, iNaturalist username, or iNaturalist project
+- Search by genus name, family name, iNaturalist taxon ID, iNaturalist username, or iNaturalist project
+- Resolve homonyms with `--taxon-id`: when two taxa share a name and rank, the tool lists their IDs and you re-run with the one you want
 - Verifies that the specified genus, family, or username exists before searching
 - Checks if the original observation number already matches the search criterion before searching for variations
 - Generates all possible variations with a configurable number of digits that might be wrong (default: 1) - _Now more robust for multiple digits off!_
@@ -68,7 +69,7 @@ Or just copy the code from Github and paste it into a file named `inat_finder.py
 ## Usage
 
 ```
-python inat_finder.py (--genus <genus> | --family <family> | --user <username> | --project <project>) <observation_number_or_url> [options]
+python inat_finder.py (--genus NAME | --family NAME | --taxon-id ID | --user USER | --project PROJECT) OBSERVATION [options]
 ```
 
 ### Required Arguments
@@ -76,6 +77,7 @@ python inat_finder.py (--genus <genus> | --family <family> | --user <username> |
 - Either:
   - `--genus <genus>`: The genus name to match (e.g., "Amanita")
   - `--family <family>`: The family name to match (e.g., "Amanitaceae")
+  - `--taxon-id <id>`: The iNaturalist taxon ID to match (e.g., 48419). Matches the taxon itself and every descendant of it, at any rank.
   - `--user <username>`: The iNaturalist username to match (e.g., "alan_rockefeller")
   - `--project <project>`: The iNaturalist project to search within (ID, slug, URL, or title)
 - `observation_number_or_url`: The potentially mistyped iNaturalist observation number or a complete iNaturalist URL
@@ -100,6 +102,18 @@ Search more broadly for an observation in the family Amanitaceae:
 ```bash
 python inat_finder.py --family Amanitaceae 12345678
 ```
+
+Search by an explicit iNaturalist taxon ID, which matches that taxon and all of its descendants:
+
+```bash
+python inat_finder.py --taxon-id 48419 123456789
+```
+
+`--taxon-id` is the option to reach for when:
+
+- multiple taxa share the same name (the same genus name can exist in more than one kingdom), and the tool refuses to guess between them;
+- you already know the iNaturalist taxon ID and want to skip the name lookup;
+- you want to search an arbitrary rank - order, tribe, section, subspecies - that `--genus` and `--family` cannot express.
 
 Search for observations by a specific user with one digit off from 123456789:
 
@@ -133,7 +147,7 @@ python inat_finder.py --genus Boletus 123456789 --verbose
 
 ## How It Works
 
-1. The script first verifies that the specified genus, family, or username exists on iNaturalist (API error messages are now more detailed).
+1. The script first verifies that the specified genus, family, taxon ID, or username exists on iNaturalist (API error messages are now more detailed).
 2. If a URL is provided, the script extracts the observation number from it.
 3. For very short numbers (5 digits or less), it suggests checking Mushroom Observer.
 4. The script checks if the original observation number already matches the specified search criterion.
@@ -141,7 +155,7 @@ python inat_finder.py --genus Boletus 123456789 --verbose
 6. For short numbers (<9 digits), it also inserts one or two digits at every possible position, internal positions included.
 7. For long numbers (>5 digits), it also generates variations with 1-2 digits removed. Adjacent digit swaps are added when `--digits 1` does not already cover them.
 8. It streams these variations, in batches of 200 IDs per request, to the iNaturalist API. Batches whose request fails are retried, and any candidates that still could not be checked are reported as an incomplete search.
-9. For each observation found, it checks if the selected genus, family, username, or project matches what you're looking for.
+9. For each observation found, it checks if the selected genus, family, taxon ID, username, or project matches what you're looking for. Genus, family and `--taxon-id` searches all decide membership from the observation's taxonomic ancestry, never from a taxon name.
 10. It presents all matching observations, including the creator username and direct links to view them on iNaturalist.org.
 11. The progress bar's Estimated Time of Arrival (ETA) is now more accurate due to a refined calculation method.
 
@@ -168,9 +182,11 @@ Be cautious when setting high values for `--digits` as it can result in very lon
 ## Exit Status
 
 - `0` - the search finished, whether or not matches were found
-- `1` - bad input, or the genus, family, user, or project does not exist
+- `1` - bad input, or the genus, family, taxon ID, user, or project does not exist
 - `2` - the search could not be completed because iNaturalist could not be reached
 - `130` - the search was interrupted with Ctrl+C
+
+Command-line syntax errors caught by the argument parser - an unknown option, a missing observation number, or two conflicting search criteria such as `--genus` together with `--taxon-id` - also exit `2`, with a usage message on stderr. Values the script validates itself, such as an invalid `--taxon-id`, exit `1`. A caller that needs to distinguish a usage error from an unreachable API can check stderr, since the API failure message goes to stdout.
 
 ## Contributing
 

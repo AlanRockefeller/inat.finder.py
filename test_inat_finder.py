@@ -1,4 +1,5 @@
 import contextlib
+import io
 import itertools
 import math
 import types
@@ -108,6 +109,22 @@ class TestInatFinderFunctions(unittest.TestCase):
         self.assertEqual(generate_digit_variations("", 0), [""])
         self.assertEqual(generate_digit_variations("", 1), [])
         self.assertEqual(generate_digit_variations("", 2), [])
+
+    def test_eager_digit_variations_refuses_pathological_materialization(self):
+        with (
+            patch.object(inat_finder, "iter_digit_variations") as iterator,
+            self.assertRaisesRegex(
+                ValueError, r"899999999 candidates.*iter_digit_variations"
+            ),
+        ):
+            generate_digit_variations("123456789", 9)
+        iterator.assert_not_called()
+
+    def test_large_digit_variations_remain_streamable(self):
+        streamed = list(
+            itertools.islice(inat_finder.iter_digit_variations("123456789", 9), 3)
+        )
+        self.assertEqual(streamed, ["223456789", "323456789", "423456789"])
 
     # Test methods for generate_digit_additions
     def test_gda_all_additions(self):
@@ -322,15 +339,15 @@ class TestInatFinderFunctions(unittest.TestCase):
         )
 
     def test_taxon_matching_direct_ancestor_and_malformed_inputs(self):
-        direct = {"taxon": {"id": 47158, "name": "Amanita", "rank": "genus"}}
+        direct = {"taxon": {"id": 48419, "name": "Amanita", "rank": "genus"}}
         ancestor = {
-            "taxon": {"id": 1, "ancestor_ids": [47158], "name": "Other species"}
+            "taxon": {"id": 1, "ancestor_ids": [48419], "name": "Other species"}
         }
-        self.assertTrue(inat_finder.check_observation_genus(direct, "Amanita", 47158))
-        self.assertTrue(inat_finder.check_observation_genus(ancestor, "Amanita", 47158))
-        self.assertFalse(inat_finder.check_observation_genus({}, "Amanita", 47158))
+        self.assertTrue(inat_finder.check_observation_genus(direct, "Amanita", 48419))
+        self.assertTrue(inat_finder.check_observation_genus(ancestor, "Amanita", 48419))
+        self.assertFalse(inat_finder.check_observation_genus({}, "Amanita", 48419))
         self.assertFalse(
-            inat_finder.check_observation_genus({"taxon": []}, "Amanita", 47158)
+            inat_finder.check_observation_genus({"taxon": []}, "Amanita", 48419)
         )
         self.assertFalse(inat_finder.check_observation_user([], "someone"))
         self.assertFalse(inat_finder.check_observation_user({"user": "bad"}, "someone"))
@@ -342,7 +359,7 @@ class TestInatFinderFunctions(unittest.TestCase):
             "taxon": {"id": 99, "name": "Amanita example", "rank": "species"}
         }
         self.assertFalse(
-            inat_finder.check_observation_genus(observation, "Amanita", 47158)
+            inat_finder.check_observation_genus(observation, "Amanita", 48419)
         )
         self.assertFalse(
             inat_finder.check_observation_genus(
@@ -357,7 +374,7 @@ class TestInatFinderFunctions(unittest.TestCase):
                     }
                 },
                 "Amanita",
-                47158,
+                48419,
             )
         )
         self.assertTrue(inat_finder.check_observation_genus(observation, "Amanita"))
@@ -370,7 +387,7 @@ class TestInatFinderFunctions(unittest.TestCase):
                 "id": 99,
                 "name": "Amanita muscaria",
                 "rank": "species",
-                "ancestors": [{"id": 47158, "name": "Amanita", "rank": "genus"}],
+                "ancestors": [{"id": 48419, "name": "Amanita", "rank": "genus"}],
             }
         }
         self.assertFalse(
@@ -378,7 +395,7 @@ class TestInatFinderFunctions(unittest.TestCase):
         )
         # The same observation matches when the verified ID is the one it carries.
         self.assertTrue(
-            inat_finder.check_observation_genus(observation, "Amanita", 47158)
+            inat_finder.check_observation_genus(observation, "Amanita", 48419)
         )
 
     def test_same_name_taxon_with_different_id_is_not_a_match(self):
@@ -389,7 +406,7 @@ class TestInatFinderFunctions(unittest.TestCase):
                 "id": 500,
                 "name": "Prunella vulgaris",
                 "rank": "species",
-                "ancestor_ids": [47126, 999],
+                "ancestor_ids": [PLANTAE_ID, 999],
             }
         }
         bird_genus_id = 13094
@@ -402,7 +419,7 @@ class TestInatFinderFunctions(unittest.TestCase):
                 "id": 999,
                 "name": "Prunella",
                 "rank": "genus",
-                "ancestor_ids": [47126, 999],
+                "ancestor_ids": [PLANTAE_ID, 999],
             }
         }
         self.assertFalse(
@@ -493,14 +510,55 @@ class TestInatFinderFunctions(unittest.TestCase):
         fallback = Mock(status_code=200)
         fallback.raise_for_status.return_value = None
         fallback.json.return_value = {
-            "results": [{"id": 47158, "name": "Amanita", "rank": "genus"}]
+            "results": [{"id": 48419, "name": "Amanita", "rank": "genus"}]
         }
         with patch.object(
             inat_finder, "api_get", side_effect=[autocomplete, fallback]
         ) as api_get:
             result = inat_finder.find_taxon("amanita", "genus")
-        self.assertEqual(result["id"], 47158)
+        self.assertEqual(result["id"], 48419)
         self.assertEqual(api_get.call_args_list[0].kwargs["params"]["per_page"], 30)
+
+    def test_find_taxon_returns_one_exact_match_after_both_lookups(self):
+        taxon = {"id": 48419, "name": "Amanita", "rank": "genus"}
+        with patch.object(
+            inat_finder,
+            "api_get_json",
+            side_effect=[{"results": [taxon]}, {"results": []}],
+        ) as api_get_json:
+            result = inat_finder.find_taxon("amanita", "genus")
+        self.assertIs(result, taxon)
+        self.assertEqual(api_get_json.call_count, 2)
+
+    def test_find_taxon_deduplicates_same_id_across_lookup_methods(self):
+        autocomplete_taxon = {"id": 48419, "name": "Amanita", "rank": "genus"}
+        search_taxon = {"id": "48419", "name": "Amanita", "rank": "genus"}
+        with patch.object(
+            inat_finder,
+            "api_get_json",
+            side_effect=[
+                {"results": [autocomplete_taxon]},
+                {"results": [search_taxon]},
+            ],
+        ):
+            result = inat_finder.find_taxon("Amanita", "genus")
+        self.assertIs(result, autocomplete_taxon)
+
+    def test_find_taxon_rejects_distinct_exact_homonyms(self):
+        first = {"id": 10, "name": "Duplicata", "rank": "genus"}
+        second = {"id": 20, "name": "Duplicata", "rank": "genus"}
+        with (
+            patch.object(
+                inat_finder,
+                "api_get_json",
+                side_effect=[{"results": [first]}, {"results": [second]}],
+            ),
+            self.assertRaises(inat_finder.TaxonAmbiguityError) as raised,
+        ):
+            inat_finder.find_taxon("Duplicata", "genus")
+        self.assertEqual(
+            [taxon["id"] for taxon in raised.exception.candidates], [10, 20]
+        )
 
     def test_project_slug_uses_direct_endpoint(self):
         response = Mock(status_code=200)
@@ -633,7 +691,7 @@ class TestInatFinderFunctions(unittest.TestCase):
             patch.object(
                 inat_finder,
                 "find_taxon",
-                return_value={"id": 47158, "name": "Amanita", "rank": "genus"},
+                return_value={"id": 48419, "name": "Amanita", "rank": "genus"},
             ),
             patch.object(
                 inat_finder, "batch_check_observations", side_effect=fake_batch_check
@@ -671,7 +729,7 @@ class TestInatFinderFunctions(unittest.TestCase):
             patch.object(
                 inat_finder,
                 "find_taxon",
-                return_value={"id": 47158, "name": "Amanita", "rank": "genus"},
+                return_value={"id": 48419, "name": "Amanita", "rank": "genus"},
             ),
             patch.object(
                 inat_finder, "fetch_observations", return_value=[]
@@ -770,10 +828,10 @@ class TestInatFinderFunctions(unittest.TestCase):
         matching_observation = {
             "id": 123456789,
             "taxon": {
-                "id": 47158,
+                "id": 48419,
                 "name": "Amanita muscaria",
                 "rank": "species",
-                "ancestor_ids": [47158],
+                "ancestor_ids": [48419],
             },
             "user": {"login": "observer"},
         }
@@ -782,7 +840,7 @@ class TestInatFinderFunctions(unittest.TestCase):
             patch.object(
                 inat_finder,
                 "find_taxon",
-                return_value={"id": 47158, "name": "Amanita", "rank": "genus"},
+                return_value={"id": 48419, "name": "Amanita", "rank": "genus"},
             ),
             patch.object(
                 inat_finder,
@@ -885,7 +943,22 @@ class TestInatFinderFunctions(unittest.TestCase):
         )
 
 
-def _observation(obs_id, login="observer", taxon_id=47158, ancestor_ids=(47158,)):
+# Real iNaturalist taxon IDs, so fixtures stay recognisable to a maintainer who
+# looks them up: 48419 is the genus Amanita, 48715 the species Amanita muscaria,
+# 118249 the family Amanitaceae, 47170 the kingdom Fungi, 47126 the kingdom Plantae.
+AMANITA_ID = 48419
+AMANITA_MUSCARIA_ID = 48715
+AMANITACEAE_ID = 118249
+FUNGI_ID = 47170
+PLANTAE_ID = 47126
+
+
+def _observation(
+    obs_id,
+    login="observer",
+    taxon_id=AMANITA_MUSCARIA_ID,
+    ancestor_ids=(FUNGI_ID, AMANITACEAE_ID, AMANITA_ID),
+):
     """Build a minimal observation payload shaped like the iNaturalist API's."""
     return {
         "id": obs_id,
@@ -1023,20 +1096,88 @@ class TestFailedBatchesAreNotFalseNegatives(MainRunnerMixin, unittest.TestCase):
         self.assertEqual(result.observations, [])
         self.assertEqual(result.unchecked, 0)
 
-    def test_total_outage_does_not_retain_every_failed_batch(self):
-        fake, calls = self._api_get_json(lambda ids, n: ApiError("offline"))
-        candidate_count = (inat_finder.MAX_RETRY_BATCHES + 20) * 2
-        candidates = (str(value) for value in range(1, candidate_count + 1))
+    def test_permanent_failure_followed_by_success_does_not_abort(self):
+        def per_batch(ids, call_number):
+            if ids == ["1"]:
+                return ApiError("offline")
+            return [{"id": int(ids[0])}]
+
+        fake, calls = self._api_get_json(per_batch)
         with patch.object(inat_finder, "api_get_json", side_effect=fake):
             result = inat_finder.batch_check_observations(
-                candidates, batch_size=2, message_callback=lambda message: None
+                ["1", "2", "3", "4", "5"], batch_size=1
             )
-        # Every candidate is still counted as unchecked...
+        self.assertEqual(len(calls), 6)
+        self.assertEqual(result.unchecked, 1)
+        self.assertEqual(result.failed_batches, 1)
+        self.assertEqual(
+            [observation["id"] for observation in result.observations], [2, 3, 4, 5]
+        )
+
+    def test_total_outage_stops_without_consuming_large_lazy_search(self):
+        fake, calls = self._api_get_json(lambda ids, n: ApiError("offline"))
+        candidate_count = 100_000
+        yielded = []
+
+        def candidates():
+            for value in range(1, candidate_count + 1):
+                yielded.append(value)
+                yield str(value)
+
+        progress = Mock()
+        messages = []
+        with patch.object(inat_finder, "api_get_json", side_effect=fake):
+            result = inat_finder.batch_check_observations(
+                candidates(),
+                batch_size=2,
+                total=candidate_count,
+                progress_callback=progress,
+                message_callback=messages.append,
+            )
+
+        attempted_candidates = inat_finder.MAX_CONSECUTIVE_FAILED_BATCHES * 2
+        expected_requests = inat_finder.MAX_CONSECUTIVE_FAILED_BATCHES * (
+            inat_finder.BATCH_RETRY_ROUNDS + 1
+        )
+        self.assertEqual(len(calls), expected_requests)
+        self.assertEqual(len(yielded), attempted_candidates)
         self.assertEqual(result.unchecked, candidate_count)
-        # ...but only a bounded number of batches were kept and retried.
+        self.assertEqual(
+            result.failed_batches, inat_finder.MAX_CONSECUTIVE_FAILED_BATCHES
+        )
+        progress.assert_called_once_with(candidate_count, False)
+        self.assertTrue(any("Stopping after" in message for message in messages))
+
+    def test_match_before_fail_fast_is_retained_and_progress_only_counts_success(self):
+        match = _observation(1)
+
+        def per_batch(ids, call_number):
+            if ids == ["1"]:
+                return [match]
+            return ApiError("offline")
+
+        fake, calls = self._api_get_json(per_batch)
+        progress = Mock()
+        total = 20
+        with patch.object(inat_finder, "api_get_json", side_effect=fake):
+            result = inat_finder.batch_check_observations(
+                (str(value) for value in range(1, total + 1)),
+                batch_size=1,
+                total=total,
+                progress_callback=progress,
+                message_callback=lambda message: None,
+            )
+        self.assertEqual(result.observations, [match])
+        self.assertEqual(result.unchecked, total - 1)
         self.assertEqual(
             len(calls),
-            candidate_count // 2 + inat_finder.MAX_RETRY_BATCHES,
+            1
+            + inat_finder.MAX_CONSECUTIVE_FAILED_BATCHES
+            * (inat_finder.BATCH_RETRY_ROUNDS + 1),
+        )
+        self.assertEqual(
+            [call.args for call in progress.call_args_list],
+            [(1, True), (total - 1, False)],
         )
 
     def test_batch_with_the_only_match_failing_reports_incomplete_search(self):
@@ -1226,7 +1367,7 @@ class TestSearchSizeSafety(MainRunnerMixin, unittest.TestCase):
     def _taxon_patches(self, **extra):
         patches = {
             "find_taxon": Mock(
-                return_value={"id": 47158, "name": "Amanita", "rank": "genus"}
+                return_value={"id": 48419, "name": "Amanita", "rank": "genus"}
             ),
             "fetch_observations": Mock(return_value=[]),
         }
@@ -1524,6 +1665,53 @@ class TestLookupFailuresAreNotNotFound(MainRunnerMixin, unittest.TestCase):
         ):
             inat_finder.find_taxon("Amanita", "genus")
 
+    def test_second_taxon_lookup_failure_is_not_hidden_by_first_match(self):
+        taxon = {"id": 48419, "name": "Amanita", "rank": "genus"}
+        with (
+            patch.object(
+                inat_finder,
+                "api_get_json",
+                side_effect=[{"results": [taxon]}, ApiError("fallback offline")],
+            ),
+            self.assertRaises(ApiError),
+        ):
+            inat_finder.find_taxon("Amanita", "genus")
+
+    def test_ambiguous_taxon_is_input_error_and_lists_candidate_ids(self):
+        candidates = [
+            {
+                "id": 10,
+                "name": "Duplicata",
+                "rank": "genus",
+                "iconic_taxon_name": "Plantae",
+            },
+            {"id": 20, "name": "Duplicata", "rank": "genus"},
+        ]
+        fetch_observations = Mock()
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--genus",
+                "Duplicata",
+                "123456789",
+                "--no-progress",
+            ],
+            {
+                "find_taxon": Mock(
+                    side_effect=inat_finder.TaxonAmbiguityError(
+                        "Duplicata", "genus", candidates
+                    )
+                ),
+                "fetch_observations": fetch_observations,
+            },
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("ambiguous", output)
+        self.assertIn("ID: 10", output)
+        self.assertIn("ID: 20", output)
+        self.assertNotIn("could not reach", output)
+        fetch_observations.assert_not_called()
+
     def test_project_not_found_is_friendly(self):
         missing = Mock(status_code=404)
         with patch.object(inat_finder, "api_get", return_value=missing):
@@ -1642,6 +1830,601 @@ class TestLocationFallback(unittest.TestCase):
         with patch.object(inat_finder, "fetch_places", return_value=places):
             labels = inat_finder.resolve_observation_locations(observations)
         self.assertEqual(labels[1], "Mississippi US")
+
+
+class TestTaxonIdArgumentParsing(unittest.TestCase):
+    """--taxon-id is a first-class, mutually exclusive search criterion."""
+
+    def _parse(self, argv):
+        with patch.object(inat_finder.sys, "argv", list(argv)):
+            return inat_finder.parse_arguments()
+
+    def test_taxon_id_parses(self):
+        args = self._parse(["inat_finder.py", "--taxon-id", "48419", "123456789"])
+        self.assertEqual(args.taxon_id, "48419")
+        self.assertIsNone(args.genus)
+        self.assertIsNone(args.family)
+        self.assertIsNone(args.user)
+        self.assertIsNone(args.project)
+        self.assertEqual(args.observation_number, "123456789")
+
+    def _assert_conflicts_with(self, *conflicting):
+        """Assert argparse rejects the flag combination, and pin the exit status.
+
+        Conflicting criteria are a command-line syntax error, so argparse handles
+        them and exits 2 with a usage message on stderr. That is argparse's own
+        status, not the script's API-failure status: the script's own bad-input
+        checks (an invalid --taxon-id value, for instance) exit 1. Pinned here so a
+        future change to the parser cannot silently move it.
+        """
+        argv = ["inat_finder.py", "--taxon-id", "48419", *conflicting, "123456789"]
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            self._parse(argv)
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("not allowed with argument", stderr.getvalue())
+
+    def test_taxon_id_is_mutually_exclusive_with_genus(self):
+        self._assert_conflicts_with("--genus", "Amanita")
+
+    def test_taxon_id_is_mutually_exclusive_with_family(self):
+        self._assert_conflicts_with("--family", "Amanitaceae")
+
+    def test_taxon_id_is_mutually_exclusive_with_user(self):
+        self._assert_conflicts_with("--user", "observer")
+
+    def test_taxon_id_is_mutually_exclusive_with_project(self):
+        self._assert_conflicts_with("--project", "fungi-map")
+
+    def test_valid_taxon_ids_are_accepted(self):
+        self.assertEqual(inat_finder.parse_taxon_id_argument("48419"), 48419)
+        self.assertEqual(inat_finder.parse_taxon_id_argument(" 48419 "), 48419)
+        self.assertEqual(inat_finder.parse_taxon_id_argument("1"), 1)
+
+    def test_invalid_taxon_ids_are_rejected(self):
+        for value in ("0", "-1", "-48419", "abc", "", "  ", "48419.0", "4e5", "47 158"):
+            with self.subTest(value=value):
+                self.assertIsNone(inat_finder.parse_taxon_id_argument(value))
+
+
+class TestTaxonIdInputValidation(MainRunnerMixin, unittest.TestCase):
+    """Bad --taxon-id values exit 1 without ever contacting iNaturalist."""
+
+    def _run(self, value):
+        api_get = Mock(side_effect=AssertionError("no request for invalid input"))
+        return self.run_main(
+            ["inat_finder.py", "--taxon-id", value, "123456789", "--no-progress"],
+            {"api_get": api_get, "api_get_json": api_get},
+        )
+
+    def test_zero_is_rejected(self):
+        status, output = self._run("0")
+        self.assertEqual(status, 1)
+        self.assertIn("--taxon-id must be a positive iNaturalist taxon ID", output)
+
+    def test_negative_is_rejected(self):
+        status, output = self._run("-5")
+        self.assertEqual(status, 1)
+        self.assertIn("--taxon-id must be a positive iNaturalist taxon ID", output)
+
+    def test_non_numeric_is_rejected(self):
+        status, output = self._run("Amanita")
+        self.assertEqual(status, 1)
+        self.assertIn("--taxon-id must be a positive iNaturalist taxon ID", output)
+
+    def test_malformed_is_rejected(self):
+        status, output = self._run("48419,60773")
+        self.assertEqual(status, 1)
+        self.assertIn("--taxon-id must be a positive iNaturalist taxon ID", output)
+
+
+class TestFindTaxonById(unittest.TestCase):
+    """Taxon-ID lookups separate 'not there' from 'could not look it up'."""
+
+    def setUp(self):
+        inat_finder.RATE_LIMITER.reset()
+
+    def _response(self, status_code, payload=None, unreadable=False):
+        response = Mock(status_code=status_code)
+        if unreadable:
+            response.json.side_effect = ValueError("not json")
+        else:
+            response.json.return_value = payload
+        return response
+
+    def test_valid_taxon_resolves(self):
+        taxon = {
+            "id": 48419,
+            "name": "Amanita",
+            "rank": "genus",
+            "preferred_common_name": "fly agarics",
+            "iconic_taxon_name": "Fungi",
+        }
+        with patch.object(
+            inat_finder,
+            "api_get",
+            return_value=self._response(200, {"results": [taxon]}),
+        ):
+            self.assertEqual(inat_finder.find_taxon_by_id(48419), taxon)
+
+    def test_missing_taxon_returns_none(self):
+        with patch.object(inat_finder, "api_get", return_value=self._response(404)):
+            self.assertIsNone(inat_finder.find_taxon_by_id(999999999999))
+
+    def test_empty_results_return_none(self):
+        with patch.object(
+            inat_finder, "api_get", return_value=self._response(200, {"results": []})
+        ):
+            self.assertIsNone(inat_finder.find_taxon_by_id(999999999999))
+
+    def test_api_failure_propagates(self):
+        with (
+            patch.object(inat_finder, "api_get", side_effect=ApiError("503")),
+            self.assertRaises(ApiError),
+        ):
+            inat_finder.find_taxon_by_id(48419)
+
+    def test_unreadable_body_is_not_not_found(self):
+        with (
+            patch.object(
+                inat_finder,
+                "api_get",
+                return_value=self._response(200, unreadable=True),
+            ),
+            self.assertRaises(ApiError),
+        ):
+            inat_finder.find_taxon_by_id(48419)
+
+    def test_malformed_payloads_are_not_not_found(self):
+        for payload in ({}, {"results": None}, {"results": {"id": 48419}}, []):
+            with (
+                self.subTest(payload=payload),
+                patch.object(
+                    inat_finder,
+                    "api_get",
+                    return_value=self._response(200, payload),
+                ),
+                self.assertRaises(ApiError),
+            ):
+                inat_finder.find_taxon_by_id(48419)
+
+    def test_results_for_a_different_taxon_are_not_not_found(self):
+        with (
+            patch.object(
+                inat_finder,
+                "api_get",
+                return_value=self._response(
+                    200, {"results": [{"id": 99, "name": "X"}]}
+                ),
+            ),
+            self.assertRaises(ApiError),
+        ):
+            inat_finder.find_taxon_by_id(48419)
+
+
+class TestTaxonIdMatching(unittest.TestCase):
+    """--taxon-id matching is strictly ancestry/ID based."""
+
+    def test_exact_taxon_id_matches(self):
+        observation = _observation(
+            1, taxon_id=AMANITA_ID, ancestor_ids=(FUNGI_ID, AMANITA_ID)
+        )
+        self.assertTrue(inat_finder.check_observation_taxon_id(observation, AMANITA_ID))
+
+    def test_descendant_matches_through_ancestor_ids(self):
+        # Amanita muscaria sits under the genus Amanita.
+        observation = _observation(
+            2,
+            taxon_id=AMANITA_MUSCARIA_ID,
+            ancestor_ids=(FUNGI_ID, AMANITACEAE_ID, AMANITA_ID),
+        )
+        self.assertTrue(inat_finder.check_observation_taxon_id(observation, AMANITA_ID))
+
+    def test_descendant_matches_through_ancestors_records(self):
+        observation = {
+            "id": 3,
+            "taxon": {
+                "id": 48715,
+                "name": "Amanita muscaria",
+                "rank": "species",
+                "ancestors": [{"id": 48419, "name": "Amanita", "rank": "genus"}],
+            },
+        }
+        self.assertTrue(inat_finder.check_observation_taxon_id(observation, 48419))
+
+    def test_unrelated_observation_does_not_match(self):
+        # A plant, nowhere near the genus Amanita.
+        observation = _observation(4, taxon_id=52786, ancestor_ids=(PLANTAE_ID, 52785))
+        self.assertFalse(
+            inat_finder.check_observation_taxon_id(observation, AMANITA_ID)
+        )
+
+    def test_identical_name_cannot_override_an_id_mismatch(self):
+        # A hypothetical plant genus sharing the fungal genus's name. IDs 998-1000
+        # are deliberately fictional; only the name collision matters here.
+        observation = {
+            "id": 5,
+            "taxon": {
+                "id": 999,
+                "name": "Amanita",
+                "rank": "genus",
+                "ancestor_ids": [PLANTAE_ID, 998],
+            },
+        }
+        self.assertFalse(
+            inat_finder.check_observation_taxon_id(observation, AMANITA_ID)
+        )
+        # The species name-prefix heuristic must not rescue it either.
+        species = {
+            "id": 6,
+            "taxon": {
+                "id": 1000,
+                "name": "Amanita muscaria",
+                "rank": "species",
+                "ancestor_ids": [PLANTAE_ID, 999],
+            },
+        }
+        self.assertFalse(inat_finder.check_observation_taxon_id(species, 48419))
+
+    def test_missing_or_empty_taxa_do_not_match(self):
+        self.assertFalse(inat_finder.check_observation_taxon_id({}, 48419))
+        self.assertFalse(inat_finder.check_observation_taxon_id({"id": 1}, 48419))
+        self.assertFalse(
+            inat_finder.check_observation_taxon_id({"id": 1, "taxon": None}, 48419)
+        )
+
+
+AMANITA_TAXON = {
+    "id": AMANITA_ID,
+    "name": "Amanita",
+    "rank": "genus",
+    "preferred_common_name": "fly agarics",
+    "iconic_taxon_name": "Fungi",
+}
+
+
+class TestTaxonIdSearch(MainRunnerMixin, unittest.TestCase):
+    """End-to-end --taxon-id behaviour through main()."""
+
+    def _patches(self, original=None, batch=None, **extra):
+        patches = {
+            "find_taxon_by_id": Mock(return_value=dict(AMANITA_TAXON)),
+            "fetch_observations": Mock(
+                return_value=[original] if original is not None else []
+            ),
+            "batch_check_observations": Mock(
+                side_effect=batch
+                or (lambda *a, **k: inat_finder.BatchCheckResult([], 0, 0))
+            ),
+            "resolve_observation_locations": Mock(return_value={}),
+        }
+        patches.update(extra)
+        return patches
+
+    def _argv(self, *extra):
+        return [
+            "inat_finder.py",
+            "--taxon-id",
+            "48419",
+            "123456789",
+            "--no-progress",
+            "--yes",
+            *extra,
+        ]
+
+    def test_valid_taxon_is_verified_and_described(self):
+        status, output = self.run_main(self._argv(), self._patches())
+        self.assertEqual(status, 0)
+        self.assertIn("Verifying taxon ID 48419 exists on iNaturalist...", output)
+        self.assertIn("Taxon ID 48419 verified: Amanita (genus)", output)
+        self.assertIn("Common name: fly agarics", output)
+        self.assertIn("Iconic taxon: Fungi", output)
+        self.assertIn(
+            "Looking for iNaturalist observations belonging to Amanita "
+            "(taxon ID 48419)",
+            output,
+        )
+
+    def test_missing_taxon_is_input_error(self):
+        missing = Mock(status_code=404)
+        with patch.object(inat_finder, "api_get", return_value=missing):
+            status, output = self.run_main(
+                [
+                    "inat_finder.py",
+                    "--taxon-id",
+                    "999999999999",
+                    "123456789",
+                    "--no-progress",
+                ]
+            )
+        self.assertEqual(status, 1)
+        self.assertIn("Error: Taxon ID 999999999999 not found on iNaturalist.", output)
+        self.assertNotIn("could not reach", output)
+
+    def test_taxon_lookup_api_failure_is_operational(self):
+        with patch.object(inat_finder, "api_get", side_effect=ApiError("timeout")):
+            status, output = self.run_main(
+                ["inat_finder.py", "--taxon-id", "48419", "123456789", "--no-progress"]
+            )
+        self.assertEqual(status, inat_finder.API_FAILURE_EXIT_CODE)
+        self.assertNotIn("not found on iNaturalist", output)
+        self.assertIn("could not reach the iNaturalist API", output)
+
+    def test_malformed_lookup_response_is_not_not_found(self):
+        garbage = Mock(status_code=200)
+        garbage.json.return_value = {"results": "nope"}
+        with patch.object(inat_finder, "api_get", return_value=garbage):
+            status, output = self.run_main(
+                ["inat_finder.py", "--taxon-id", "48419", "123456789", "--no-progress"]
+            )
+        self.assertEqual(status, inat_finder.API_FAILURE_EXIT_CODE)
+        self.assertNotIn("not found on iNaturalist", output)
+
+    def test_matching_original_observation_is_recognised(self):
+        original = _observation(123456789, taxon_id=48715, ancestor_ids=(47170, 48419))
+        with patch("builtins.input", return_value="n"):
+            status, output = self.run_main(
+                [
+                    "inat_finder.py",
+                    "--taxon-id",
+                    "48419",
+                    "123456789",
+                    "--no-progress",
+                ],
+                self._patches(original=original),
+            )
+        self.assertEqual(status, 0)
+        self.assertIn(
+            "already belongs to Amanita (taxon ID 48419).",
+            output,
+        )
+        self.assertIn("Found 1 potential matches", output)
+
+    def test_nonmatching_original_observation_continues_searching(self):
+        original = _observation(123456789, taxon_id=52786, ancestor_ids=(47126,))
+        batch_check = Mock(
+            side_effect=lambda *a, **k: inat_finder.BatchCheckResult([], 0, 0)
+        )
+        status, output = self.run_main(
+            self._argv(),
+            self._patches(original=original, batch_check_observations=batch_check),
+        )
+        self.assertEqual(status, 0)
+        self.assertIn(
+            "does not belong to taxon ID 48419 (Amanita).",
+            output,
+        )
+        batch_check.assert_called_once()
+        self.assertIn("2. The taxon ID might be incorrect", output)
+
+    def test_matching_original_appears_exactly_once_when_search_continues(self):
+        original = _observation(123456789, taxon_id=48715, ancestor_ids=(48419,))
+
+        def fake_batch(variations, batch_size=None, **kwargs):
+            kwargs["results_callback"]([dict(original)])
+            return inat_finder.BatchCheckResult([dict(original)], 0, 0)
+
+        status, output = self.run_main(
+            self._argv(), self._patches(original=original, batch=fake_batch)
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("Found 1 potential matches", output)
+        self.assertEqual(output.count("Observation #123456789"), 1)
+
+    def test_matching_variation_is_reported(self):
+        alternate = _observation(
+            123456788, login="someone", taxon_id=48715, ancestor_ids=(47170, 48419)
+        )
+        unrelated = _observation(
+            123456787, login="other", taxon_id=52786, ancestor_ids=(47126,)
+        )
+
+        def fake_batch(variations, batch_size=None, **kwargs):
+            kwargs["results_callback"]([alternate, unrelated])
+            return inat_finder.BatchCheckResult([], 0, 0)
+
+        status, output = self.run_main(
+            self._argv(),
+            self._patches(
+                batch=fake_batch,
+                resolve_observation_locations=Mock(
+                    return_value={123456788: "Pike Co. MS US"}
+                ),
+            ),
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("Found 1 potential matches", output)
+        self.assertIn("Observation #123456788 - Amanita muscaria", output)
+        self.assertIn("Created by: someone", output)
+        self.assertIn("Location: Pike Co. MS US", output)
+        self.assertIn("URL: https://www.inaturalist.org/observations/123456788", output)
+        self.assertNotIn("123456787", output)
+
+    def test_no_matches_uses_taxon_id_wording(self):
+        status, output = self.run_main(self._argv(), self._patches())
+        self.assertEqual(status, 0)
+        self.assertIn("No matches found. Consider these possibilities:", output)
+        self.assertIn("2. The taxon ID might be incorrect", output)
+        self.assertNotIn("genus name might be incorrect", output)
+        self.assertNotIn("family name might be incorrect", output)
+        self.assertNotIn("username might be incorrect", output)
+        self.assertNotIn("project might be incorrect", output)
+
+    def test_incomplete_search_still_reports_partial_results(self):
+        alternate = _observation(123456788, taxon_id=48715, ancestor_ids=(48419,))
+
+        def fake_batch(variations, batch_size=None, **kwargs):
+            kwargs["results_callback"]([alternate])
+            return inat_finder.BatchCheckResult([], 17, 1)
+
+        status, output = self.run_main(self._argv(), self._patches(batch=fake_batch))
+        self.assertEqual(status, inat_finder.API_FAILURE_EXIT_CODE)
+        self.assertIn("Search incomplete - results may be incomplete.", output)
+        self.assertIn("17 candidate(s) could not be checked", output)
+        self.assertIn("Found 1 potential matches (partial results)", output)
+
+
+HOMONYM_CANDIDATES = [
+    {"id": 10, "name": "Duplicata", "rank": "genus", "iconic_taxon_name": "Plantae"},
+    {"id": 20, "name": "Duplicata", "rank": "genus", "iconic_taxon_name": "Fungi"},
+]
+
+
+class TestTaxonAmbiguityPointsAtTaxonId(MainRunnerMixin, unittest.TestCase):
+    """A homonym must be resolvable with the IDs the error prints."""
+
+    def _run(self, *extra):
+        fetch_observations = Mock()
+        return self.run_main(
+            [
+                "inat_finder.py",
+                "--genus",
+                "Duplicata",
+                "123456789",
+                "--no-progress",
+                *extra,
+            ],
+            {
+                "find_taxon": Mock(
+                    side_effect=inat_finder.TaxonAmbiguityError(
+                        "Duplicata", "genus", HOMONYM_CANDIDATES
+                    )
+                ),
+                "fetch_observations": fetch_observations,
+            },
+        )
+
+    def test_candidate_ids_are_listed(self):
+        status, output = self._run()
+        self.assertEqual(status, 1)
+        self.assertIn("ID: 10; scientific name: Duplicata; rank: genus", output)
+        self.assertIn("ID: 20; scientific name: Duplicata; rank: genus", output)
+        self.assertIn("iconic taxon: Plantae", output)
+        self.assertIn("iconic taxon: Fungi", output)
+
+    def test_message_tells_the_user_to_use_taxon_id(self):
+        status, output = self._run()
+        self.assertEqual(status, 1)
+        self.assertIn("Re-run the search using the desired taxon ID", output)
+        self.assertIn("--taxon-id", output)
+        self.assertNotIn(
+            "Please use a taxon name and rank that resolve to one iNaturalist", output
+        )
+
+    def test_suggested_command_uses_the_supplied_observation_number(self):
+        status, output = self._run()
+        self.assertEqual(status, 1)
+        self.assertIn("python inat_finder.py --taxon-id 10 123456789", output)
+
+    def test_suggested_command_keeps_a_non_default_digits(self):
+        status, output = self._run("--digits", "2")
+        self.assertEqual(status, 1)
+        self.assertIn(
+            "python inat_finder.py --taxon-id 10 123456789 --digits 2", output
+        )
+
+    def test_suggested_command_works_from_a_url(self):
+        fetch_observations = Mock()
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--genus",
+                "Duplicata",
+                "https://www.inaturalist.org/observations/123456789",
+                "--no-progress",
+            ],
+            {
+                "find_taxon": Mock(
+                    side_effect=inat_finder.TaxonAmbiguityError(
+                        "Duplicata", "genus", HOMONYM_CANDIDATES
+                    )
+                ),
+                "fetch_observations": fetch_observations,
+            },
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("--taxon-id 10 123456789", output)
+
+
+class TestExistingCriteriaStillWork(MainRunnerMixin, unittest.TestCase):
+    """Adding --taxon-id must not disturb the other search criteria."""
+
+    def _run(self, argv, patches):
+        base = {
+            "fetch_observations": Mock(return_value=[]),
+            "batch_check_observations": Mock(
+                return_value=inat_finder.BatchCheckResult([], 0, 0)
+            ),
+            "resolve_observation_locations": Mock(return_value={}),
+        }
+        base.update(patches)
+        return self.run_main(argv + ["--no-progress", "--yes"], base)
+
+    def test_genus_still_reports_genus_wording(self):
+        status, output = self._run(
+            ["inat_finder.py", "--genus", "Amanita", "123456789"],
+            {
+                "find_taxon": Mock(
+                    return_value={"id": 48419, "name": "Amanita", "rank": "genus"}
+                )
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertIn(
+            "Looking for iNaturalist observations with genus 'Amanita'", output
+        )
+        self.assertIn("2. The genus name might be incorrect", output)
+
+    def test_family_still_reports_family_wording(self):
+        status, output = self._run(
+            ["inat_finder.py", "--family", "Amanitaceae", "123456789"],
+            {
+                "find_taxon": Mock(
+                    return_value={
+                        "id": 118249,
+                        "name": "Amanitaceae",
+                        "rank": "family",
+                    }
+                )
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertIn(
+            "Looking for iNaturalist observations in family 'Amanitaceae'", output
+        )
+        self.assertIn("2. The family name might be incorrect", output)
+
+    def test_user_still_reports_user_wording(self):
+        status, output = self._run(
+            ["inat_finder.py", "--user", "observer", "123456789"],
+            {"verify_user_exists": Mock(return_value=True)},
+        )
+        self.assertEqual(status, 0)
+        self.assertIn(
+            "Looking for iNaturalist observations created by user 'observer'", output
+        )
+        self.assertIn("2. The username might be incorrect", output)
+
+    def test_project_still_reports_project_wording(self):
+        status, output = self._run(
+            ["inat_finder.py", "--project", "fungi-map", "123456789"],
+            {
+                "resolve_project_identifier": Mock(
+                    return_value=(
+                        "42",
+                        {"id": 42, "title": "Fungi Map", "slug": "fungi-map"},
+                    )
+                )
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertIn(
+            "Looking for iNaturalist observations in project 'Fungi Map'", output
+        )
+        self.assertIn("2. The project might be incorrect", output)
 
 
 if __name__ == "__main__":

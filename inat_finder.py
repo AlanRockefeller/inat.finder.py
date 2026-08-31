@@ -2,11 +2,12 @@
 """
 iNaturalist Observation Finder
 
-Version 1.8.0 - By Alan Rockefeller - August 30, 2026
+Version 1.7.5 - By Alan Rockefeller - August 30, 2026
 
 This script helps find the correct iNaturalist observation number when there are mistyped digits.
 It works by systematically changing digits of the provided observation number and checking if
-any of those variations match the specified genus, family, or username in the iNaturalist database.
+any of those variations match the specified genus, family, taxon ID, or username in the
+iNaturalist database.
 
 If the observation number has fewer than 9 digits, it will also try inserting one or two missing
 digits at any position. Longer numbers are also tried with up to two digits removed, and adjacent
@@ -18,11 +19,15 @@ Mushroom Observer observation number instead.
 The script can also parse observation numbers directly from iNaturalist URLs.
 
 Usage:
-    python inat_finder.py (--genus <genus> | --family <family> | --user <username> | --project <project>) <observation_number_or_url> [options]
+    python inat_finder.py (--genus NAME | --family NAME | --taxon-id ID | --user USER | --project PROJECT) OBSERVATION [options]
 
 Arguments:
     --genus <genus>         The genus name to match (e.g., "Galerina")
     --family <family>       The family name to match (e.g., "Amanitaceae")
+    --taxon-id <id>         The iNaturalist taxon ID to match, at any rank (e.g., 48419).
+                            Matches the taxon itself and every descendant of it. Use this
+                            when several taxa share a name, when you already know the ID,
+                            or to search a rank that --genus and --family cannot express.
     --user <username>       The iNaturalist username to match (e.g., "alan_rockefeller")
     --project <project>     The iNaturalist project to search within (ID, slug, URL, or title)
     observation_number_or_url  The potentially mistyped iNaturalist observation number
@@ -36,9 +41,14 @@ Options:
 
 Exit status:
     0   the search finished (whether or not matches were found)
-    1   bad input, or the genus/family/user/project does not exist
+    1   bad input, or the genus/family/taxon/user/project does not exist
     2   the search could not be completed because iNaturalist could not be reached
     130 the search was interrupted with Ctrl+C
+
+    Command-line syntax errors caught by the argument parser - an unknown option, a
+    missing observation number, or two conflicting search criteria - also exit 2,
+    printing a usage message to stderr. A caller that needs to tell the two apart
+    can check stderr: an API failure writes its explanation to stdout instead.
 """
 
 import argparse
@@ -55,7 +65,7 @@ from email.utils import parsedate_to_datetime
 import requests
 from tqdm import tqdm
 
-VERSION = "1.8.0"
+VERSION = "1.7.5"
 API_BASE_URL = "https://api.inaturalist.org/v1"
 BATCH_SIZE = 200
 REQUEST_TIMEOUT = 20
@@ -64,14 +74,18 @@ RATE_LIMIT_DELAY = 1.0
 RETRYABLE_STATUS_CODES = (429, 500, 502, 503, 504)
 # Extra passes over batches that failed every attempt inside api_get().
 BATCH_RETRY_ROUNDS = 1
-# Cap on failed batches kept for retry, so a total outage during a large search
-# cannot pull the whole candidate space back into memory.
-MAX_RETRY_BATCHES = 50
+# Stop pulling new lazy batches after this many batches fail both their initial
+# request and all batch retry rounds. This bounds requests during a sustained
+# outage while allowing isolated failures to recover.
+MAX_CONSECUTIVE_FAILED_BATCHES = 4
 LARGE_SEARCH_THRESHOLD = 5000
 # Hard ceiling on how many candidates may be checked. Candidates are streamed, so
 # this limit is about search time rather than memory, but it also keeps a mistyped
 # --digits from starting a search that could never realistically finish.
 MAX_SEARCH_CANDIDATES = 1_000_000
+# The compatibility helper returns a real list, whose strings and references use
+# substantially more memory than the streamed CLI search. Keep its ceiling lower.
+MAX_EAGER_CANDIDATES = 100_000
 OBSERVATION_FIELDS = "id,taxon,user,place_ids,place_guess"
 PLACE_FIELDS = "id,name,admin_level,display_name"
 # Exit status used when the API could not be reached, so a failed lookup or an
@@ -95,6 +109,18 @@ class ApiError(RuntimeError):
     This is deliberately distinct from a successful lookup that found nothing, so
     an outage is never reported to the user as "not found".
     """
+
+
+class TaxonAmbiguityError(ValueError):
+    """More than one distinct taxon exactly matched a requested name and rank."""
+
+    def __init__(self, taxon_name, rank, candidates):
+        self.taxon_name = taxon_name
+        self.rank = rank
+        self.candidates = tuple(candidates)
+        super().__init__(
+            f"{len(self.candidates)} distinct taxa match {rank} '{taxon_name}'"
+        )
 
 
 class RateLimiter:
@@ -237,11 +263,28 @@ def _is_valid_candidate(value):
     return bool(value) and (len(value) == 1 or not value.startswith("0"))
 
 
+def parse_taxon_id_argument(value):
+    """Return the positive integer taxon ID in ``value``, or None if it is invalid.
+
+    Argparse cannot use ``type=int`` here: an invalid value must exit with the
+    script's bad-input status 1, not argparse's own status 2. Zero, negative and
+    non-numeric values are all rejected.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text.isdigit():
+        return None
+    number = int(text)
+    return number if number > 0 else None
+
+
 def parse_arguments():
     """
     Parses command-line arguments for the iNaturalist observation finder.
 
-    This function sets up an argument parser to accept a genus, family, username, or project, and a
+    This function sets up an argument parser to accept a genus, family, taxon ID,
+    username, or project, and a
     potentially mistyped observation number (or URL). It also supports options to specify
     the number of digits that might be incorrect (default: 1), enable verbose output,
     disable the progress bar, and assume "yes" at every confirmation prompt. If no
@@ -262,6 +305,15 @@ def parse_arguments():
     group.add_argument("--genus", help="The genus name to match (e.g., 'Amanita')")
     group.add_argument(
         "--family", help="The family name to match (e.g., 'Amanitaceae')"
+    )
+    group.add_argument(
+        "--taxon-id",
+        dest="taxon_id",
+        metavar="ID",
+        help=(
+            "The iNaturalist taxon ID to match at any rank (e.g., 48419). Matches "
+            "the taxon itself and all of its descendants"
+        ),
     )
     group.add_argument("--user", help="The iNaturalist username to match")
     group.add_argument(
@@ -388,6 +440,14 @@ def generate_digit_variations(number_str, digits_off=1):
     """
     if digits_off <= 0:
         return [number_str]  # No variations if digits_off is 0 or negative
+    candidate_count = count_digit_variations(number_str, digits_off)
+    if candidate_count > MAX_EAGER_CANDIDATES:
+        raise ValueError(
+            f"generate_digit_variations() would eagerly materialize "
+            f"{candidate_count} candidates, which is unsafe for this compatibility "
+            f"helper (limit: {MAX_EAGER_CANDIDATES}). Use "
+            "iter_digit_variations() to stream a search this large."
+        )
     return unique_by_integer_value(iter_digit_variations(number_str, digits_off))
 
 
@@ -623,18 +683,20 @@ def find_taxon(taxon_name, rank):
         rank: The exact iNaturalist rank to require.
 
     Returns:
-        dict | None: The matching taxon, or None when no exact match is found.
+        dict | None: The sole matching taxon, or None when no exact match is found.
 
     Raises:
         ApiError: The lookup could not be completed, so existence is unknown.
+        TaxonAmbiguityError: Distinct taxon IDs share the requested name and rank.
     """
     requests_to_try = (
         ("/taxa/autocomplete", {"q": taxon_name, "rank": rank, "per_page": 30}),
         ("/taxa", {"q": taxon_name, "rank": rank, "per_page": 30}),
     )
+    exact_matches = {}
     for path, params in requests_to_try:
         data = api_get_json(path, params=params)
-        for taxon in data.get("results") or []:
+        for result_index, taxon in enumerate(data.get("results") or []):
             if not isinstance(taxon, dict):
                 continue
             name = taxon.get("name")
@@ -643,8 +705,81 @@ def find_taxon(taxon_name, rank):
                 and name.casefold() == taxon_name.casefold()
                 and taxon.get("rank") == rank
             ):
-                return taxon
+                taxon_id = taxon.get("id")
+                # IDs are normally integers, but normalize strings defensively so
+                # the same taxon returned by both endpoints is still one match.
+                key = str(taxon_id) if taxon_id is not None else (path, result_index)
+                exact_matches.setdefault(key, taxon)
+
+        # Once one endpoint independently establishes ambiguity, another lookup
+        # cannot make the distinct IDs unambiguous.
+        if len(exact_matches) > 1:
+            raise TaxonAmbiguityError(taxon_name, rank, exact_matches.values())
+
+    if len(exact_matches) == 1:
+        return next(iter(exact_matches.values()))
     return None
+
+
+def find_taxon_by_id(taxon_id):
+    """
+    Look up a single taxon by its iNaturalist taxon ID.
+
+    The returned taxon carries the metadata needed to describe the search target
+    (name, rank, common name, iconic taxon) and the canonical ID used for the same
+    ancestry-based matching that verified genus and family searches use.
+
+    Args:
+        taxon_id: A positive integer iNaturalist taxon ID.
+
+    Returns:
+        dict | None: The taxon record, or None when iNaturalist says the ID does
+        not exist.
+
+    Raises:
+        ApiError: The lookup could not be completed, or the API returned a body
+            that cannot be interpreted. An unreadable answer is never downgraded
+            to "not found".
+    """
+    data = api_get_json(f"/taxa/{int(taxon_id)}", allow_missing=True)
+    if data is None:
+        return None
+    if not isinstance(data, dict):
+        raise ApiError(
+            f"iNaturalist returned an unexpected response for taxon ID {taxon_id}"
+        )
+
+    results = data.get("results")
+    if results is None or not isinstance(results, list):
+        raise ApiError(
+            f"iNaturalist returned an unexpected response for taxon ID {taxon_id}"
+        )
+    if not results:
+        # A well-formed empty result really does mean the ID is not there.
+        return None
+
+    for taxon in results:
+        if isinstance(taxon, dict) and str(taxon.get("id")) == str(taxon_id):
+            return taxon
+
+    raise ApiError(
+        f"iNaturalist returned results that do not describe taxon ID {taxon_id}"
+    )
+
+
+def describe_taxon(taxon):
+    """Return a short 'Name (rank)' label for a verified taxon record."""
+    name = taxon.get("name") or "Unknown taxon"
+    rank = taxon.get("rank")
+    return f"{name} ({rank})" if rank else str(name)
+
+
+def format_taxon_reference(taxon, taxon_id):
+    """Return 'Name (taxon ID 48419)', or just the ID when the name is unknown."""
+    name = (taxon or {}).get("name")
+    if not name:
+        return f"taxon ID {taxon_id}"
+    return f"{name} (taxon ID {taxon_id})"
 
 
 def parse_project_slug_from_url(project_input):
@@ -924,10 +1059,10 @@ def batch_check_observations(
     Check observation IDs by querying the iNaturalist API in batches.
 
     ``variations`` may be any iterable, including a lazy generator, so the whole
-    search space never has to exist in memory at once. Batches that fail every
-    attempt inside :func:`api_get` are retried in extra rounds; batches that still
-    fail are counted as *unchecked* and reported to the caller, so a network
-    failure can never be presented as "no matches".
+    search space never has to exist in memory at once. A failed batch is retried
+    before another batch is pulled. Batches that still fail are counted as
+    *unchecked*, and a sustained run of permanent failures stops the iterator
+    early when its planned ``total`` is known.
 
     Args:
         variations: An iterable of observation ID strings to be verified.
@@ -939,7 +1074,9 @@ def batch_check_observations(
         results_callback: Optional callable receiving each batch's observations as soon
             as they arrive, so callers can report matches while the search runs.
         message_callback: Callable used for request error messages.
-        total: Known total number of candidates, for progress reporting.
+        total: Known total number of candidates, for progress reporting and exact
+            counting of candidates skipped by outage fail-fast. Sized iterables
+            are counted automatically when this is omitted.
         retry_rounds: Extra passes over batches that failed.
         collect_results: Keep every returned observation in the result. Callers
             that consume ``results_callback`` should pass False, so a search over
@@ -950,8 +1087,17 @@ def batch_check_observations(
         not be checked, and how many batches permanently failed.
     """
     all_results = []
-    failed_batches = []
-    dropped_unchecked = 0
+    if total is None:
+        total = getattr(variations, "total", None)
+    if total is None:
+        try:
+            total = len(variations)
+        except TypeError:
+            pass
+
+    unchecked = 0
+    failed_count = 0
+    consecutive_failures = 0
     start = 0
 
     def run_batch(batch, batch_start):
@@ -978,31 +1124,35 @@ def batch_check_observations(
         return True
 
     for batch in _iter_batches(variations, batch_size):
-        if not run_batch(batch, start):
-            if len(failed_batches) < MAX_RETRY_BATCHES:
-                failed_batches.append((batch, start))
-            else:
-                # Too many failures to retry; count them without holding on to them.
-                dropped_unchecked += len(batch)
+        checked = run_batch(batch, start)
+        for round_number in range(retry_rounds):
+            if checked:
+                break
+            message_callback(f"Retrying failed batch (attempt {round_number + 2})...")
+            checked = run_batch(batch, start)
+
         start += len(batch)
+        if checked:
+            consecutive_failures = 0
+            continue
 
-    for round_number in range(retry_rounds):
-        if not failed_batches:
+        unchecked += len(batch)
+        failed_count += 1
+        consecutive_failures += 1
+
+        if total is not None and consecutive_failures >= MAX_CONSECUTIVE_FAILED_BATCHES:
+            skipped = max(0, total - start)
+            unchecked += skipped
+            message_callback(
+                f"Stopping after {consecutive_failures} consecutive batches "
+                f"failed permanently; {skipped} planned candidate(s) will remain "
+                "unchecked."
+            )
             break
-        message_callback(
-            f"Retrying {len(failed_batches)} failed batch(es) "
-            f"(attempt {round_number + 2})..."
-        )
-        pending, failed_batches = failed_batches, []
-        for batch, batch_start in pending:
-            if not run_batch(batch, batch_start):
-                failed_batches.append((batch, batch_start))
 
-    unchecked = dropped_unchecked + sum(len(batch) for batch, _ in failed_batches)
     if unchecked and progress_callback:
         progress_callback(unchecked, False)
 
-    failed_count = len(failed_batches) + -(-dropped_unchecked // batch_size)
     return BatchCheckResult(all_results, unchecked, failed_count)
 
 
@@ -1189,6 +1339,17 @@ def check_observation_family(observation, target_family, target_taxon_id=None):
     )
 
 
+def check_observation_taxon_id(observation, target_taxon_id):
+    """Determine if an observation belongs to a taxon ID or any of its descendants.
+
+    This deliberately delegates to :func:`check_observation_taxon` with no name or
+    rank, so explicit ``--taxon-id`` searches use exactly the same strict, ID-only
+    ancestry test as verified genus and family searches, and never fall back to a
+    taxon-name heuristic.
+    """
+    return check_observation_taxon(observation, None, None, target_taxon_id)
+
+
 def check_observation_user(observation, target_username):
     """
     Determine if an observation was created by the specified username.
@@ -1286,6 +1447,7 @@ def run_search():
 
     genus = args.genus
     family = args.family
+    taxon_id_input = args.taxon_id
     username = args.user
     project_input = args.project
     obs_input = args.observation_number
@@ -1313,6 +1475,9 @@ def run_search():
     elif family:
         search_mode = "family"
         search_term = family
+    elif taxon_id_input is not None:
+        search_mode = "taxon_id"
+        search_term = taxon_id_input
     elif username:
         search_mode = "user"
         search_term = username
@@ -1322,21 +1487,106 @@ def run_search():
 
     project_id_param = None
     project_metadata = None
+    # Verified taxon metadata shared by the genus, family and --taxon-id paths.
+    # Once it is set, matching is decided purely from taxon IDs.
+    target_taxon = None
     target_taxon_id = None
+    taxon_display = None
+
+    # Validate the requested taxon ID before any request, so bad input exits 1
+    # and is never confused with a lookup failure.
+    requested_taxon_id = None
+    if search_mode == "taxon_id":
+        requested_taxon_id = parse_taxon_id_argument(taxon_id_input)
+        if requested_taxon_id is None:
+            print(
+                "Error: --taxon-id must be a positive iNaturalist taxon ID "
+                f"(got '{taxon_id_input}')."
+            )
+            sys.exit(1)
 
     # Verify that the taxon, user, or project exists before proceeding.
     # An ApiError here propagates to main(), which reports an operational failure
     # instead of claiming the taxon, user, or project does not exist.
-    print(f"Verifying {search_mode} '{search_term}' exists on iNaturalist...")
+    if search_mode == "taxon_id":
+        print(f"Verifying taxon ID {requested_taxon_id} exists on iNaturalist...")
+    else:
+        print(f"Verifying {search_mode} '{search_term}' exists on iNaturalist...")
 
-    if search_mode in ("genus", "family"):
-        verified_taxon = find_taxon(search_term, search_mode)
+    if search_mode == "taxon_id":
+        target_taxon = find_taxon_by_id(requested_taxon_id)
+        if not target_taxon:
+            print(f"Error: Taxon ID {requested_taxon_id} not found on iNaturalist.")
+            print(
+                "Please check the ID on iNaturalist, or search by name with --genus "
+                "or --family instead."
+            )
+            sys.exit(1)
+        target_taxon_id = target_taxon.get("id") or requested_taxon_id
+        print(f"✓ Taxon ID {target_taxon_id} verified: {describe_taxon(target_taxon)}")
+        common_name = target_taxon.get("preferred_common_name")
+        if common_name:
+            print(f"  Common name: {common_name}")
+        iconic_taxon = target_taxon.get("iconic_taxon_name")
+        if iconic_taxon:
+            print(f"  Iconic taxon: {iconic_taxon}")
+        taxon_display = format_taxon_reference(target_taxon, target_taxon_id)
+
+    elif search_mode in ("genus", "family"):
+        try:
+            verified_taxon = find_taxon(search_term, search_mode)
+        except TaxonAmbiguityError as error:
+            print(
+                f"Error: {search_mode.title()} '{search_term}' is ambiguous in "
+                "the iNaturalist taxonomy."
+            )
+            print("Exact matches:")
+            for taxon in error.candidates:
+                details = [
+                    f"ID: {taxon.get('id', 'unknown')}",
+                    f"scientific name: {taxon.get('name', 'unknown')}",
+                    f"rank: {taxon.get('rank', 'unknown')}",
+                ]
+                common_name = taxon.get("preferred_common_name")
+                if common_name:
+                    details.append(f"common name: {common_name}")
+                iconic_taxon = taxon.get("iconic_taxon_name")
+                if iconic_taxon:
+                    details.append(f"iconic taxon: {iconic_taxon}")
+                ancestors = taxon.get("ancestor_ids")
+                if ancestors:
+                    details.append(
+                        "ancestor IDs: " + ", ".join(str(value) for value in ancestors)
+                    )
+                print("  - " + "; ".join(details))
+            example_id = next(
+                (
+                    taxon.get("id")
+                    for taxon in error.candidates
+                    if taxon.get("id") is not None
+                ),
+                "ID",
+            )
+            example_number = parse_inat_url(obs_input)
+            if not example_number.isdigit():
+                example_number = "OBSERVATION"
+            example_command = (
+                f"  python inat_finder.py --taxon-id {example_id} {example_number}"
+            )
+            if digits_off != 1:
+                example_command += f" --digits {digits_off}"
+            print()
+            print("Re-run the search using the desired taxon ID, for example:")
+            print()
+            print(example_command)
+            return 1
         if not verified_taxon:
             print(
                 f"Error: {search_mode.title()} '{search_term}' not found in iNaturalist taxonomy."
             )
             print(f"Please check the spelling or try a different {search_mode} name.")
             sys.exit(1)
+        target_taxon = verified_taxon
         target_taxon_id = verified_taxon.get("id")
         print(
             f"✓ {search_mode.title()} '{search_term}' verified in iNaturalist taxonomy."
@@ -1444,6 +1694,8 @@ def run_search():
                 print("2. The genus name might be incorrect")
             elif search_mode == "family":
                 print("2. The family name might be incorrect")
+            elif search_mode == "taxon_id":
+                print("2. The taxon ID might be incorrect")
             elif search_mode == "user":
                 print("2. The username might be incorrect")
             elif search_mode == "project":
@@ -1504,6 +1756,14 @@ def run_search():
             print(
                 f"✓ Good news! The original observation number {obs_number} already matches family {family}."
             )
+        elif search_mode == "taxon_id" and check_observation_taxon_id(
+            obs, target_taxon_id
+        ):
+            match_found = True
+            print(
+                f"✓ Good news! The original observation number {obs_number} "
+                f"already belongs to {taxon_display}."
+            )
         elif search_mode == "user" and check_observation_user(obs, username):
             match_found = True
             print(
@@ -1524,10 +1784,17 @@ def run_search():
                 # The original observation is a real match and must be reported.
                 print_summary([original_match])
                 return API_FAILURE_EXIT_CODE if original_check_failed else 0
+        elif search_mode == "taxon_id":
+            print(
+                f"The original observation #{obs.get('id', obs_number)} exists but "
+                f"does not belong to taxon ID {target_taxon_id} "
+                f"({target_taxon.get('name', 'unknown')})."
+            )
         else:
             print(
                 f"The original observation #{obs.get('id', obs_number)} exists but does not match {search_mode} '{search_term}'."
             )
+        if not match_found:
             print(
                 f"  Actual taxon: {(obs.get('taxon') or {}).get('name', 'Unknown taxon')}"
             )
@@ -1540,6 +1807,11 @@ def run_search():
     elif search_mode == "family":
         print(
             f"Looking for iNaturalist observations in family '{family}' that might be up to {digits_off} digit(s) off from '{obs_number}'"
+        )
+    elif search_mode == "taxon_id":
+        print(
+            f"Looking for iNaturalist observations belonging to {taxon_display} "
+            f"that might be up to {digits_off} digit(s) off from '{obs_number}'"
         )
     elif search_mode == "user":
         print(
@@ -1676,6 +1948,16 @@ def run_search():
                 matches.append(obs)
                 if verbose:
                     output(f"✓ Match found: Observation {obs_id} is in family {family}")
+            elif search_mode == "taxon_id" and check_observation_taxon_id(
+                obs, target_taxon_id
+            ):
+                match_found = True
+                matches.append(obs)
+                if verbose:
+                    output(
+                        f"✓ Match found: Observation {obs_id} belongs to "
+                        f"{taxon_display}"
+                    )
             elif search_mode == "user" and check_observation_user(obs, username):
                 match_found = True
                 matches.append(obs)
@@ -1693,6 +1975,8 @@ def run_search():
                     output(f"✗ Observation {obs_id} does not match genus {genus}")
                 elif search_mode == "family":
                     output(f"✗ Observation {obs_id} does not match family {family}")
+                elif search_mode == "taxon_id":
+                    output(f"✗ Observation {obs_id} does not belong to {taxon_display}")
                 elif search_mode == "user":
                     output(f"✗ Observation {obs_id} was not created by user {username}")
 
