@@ -2,6 +2,66 @@
 
 All notable changes to the inat.finder.py project will be documented in this file.
 
+## [1.8.0] - 2026-08-30
+
+### Fixed
+
+- Never report a failed API batch as "no matches". Batches whose request fails after `api_get()` retries are retried again in an extra round; candidates that still could not be checked are counted, the summary says "Search incomplete - results may be incomplete" instead of "Search complete!", and the process exits with status 2. Matches from successful batches are still shown.
+- Distinguish "not found" from an API or network failure when verifying a user, genus, family, or project. Transient failures now raise `ApiError`, which is reported once as a connection problem with exit status 2, instead of printing "Username 'x' not found on iNaturalist." Genuine 404 and empty-result responses still produce the friendly not-found messages.
+- Include the original observation in the final results when it already matches and the user chooses to keep searching. Previously the summary could announce a match and then end with "No matches found." The match list is deduplicated by observation ID, so the original is reported exactly once even if a candidate returns it again.
+- Stop a matching taxon name and rank from overriding a verified taxon-ID mismatch. Taxon names are not globally unique, so when a verified taxon ID is available the decision is made purely from the observation's `ancestor_ids` taxonomy path. Name-based heuristics remain only as a fallback when no verified ID exists.
+- Reject observation numbers with leading zeroes by normalizing them, so candidate counts stay exact and no impossible IDs are generated.
+
+### Changed
+
+- Size the candidate search space before generating it. `CandidatePlan` counts replacement variations with a closed-form calculation and streams them lazily, so `--digits 8` or `--digits 9` no longer builds a multi-hundred-million-entry list. The confirmation prompt for searches over 5,000 candidates now happens before generation, and searches needing more than 1,000,000 API-checked candidates are refused with an explanation.
+- Guarantee that every candidate is a distinct numeric observation ID, so no ID is requested twice and the progress total is exact. Adjacent-digit swaps are only added when `--digits` is 1, because a two-digit replacement search already contains them.
+- Move API pacing into `api_get()`, so validation lookups, the original-observation check, project and place lookups, and the batched search all share one request-per-second baseline. Explicit `Retry-After` backoffs are counted as the pacing delay rather than sleeping twice.
+- Distinguish checked candidates from failed ones in the progress bar: only checked candidates advance the bar, and unchecked candidates are shown as a separate count.
+- Report an ambiguous unquoted `--project` title (one ending in a short number) with a note explaining how it was parsed and suggesting quotes.
+
+### Added
+
+- Insert two missing digits at arbitrary positions, not just at the ends, so internal omissions are found. An 8-digit number now generates 3,735 insertion candidates instead of 361.
+- Add adjacent-digit transposition as a candidate class (123456789 -> 123465789).
+- Fall back to the observation's `place_guess` when structured place resolution yields no standard place, instead of printing "Unknown location".
+- Document the exit status codes: 0 finished, 1 bad input or unknown search term, 2 API failure, 130 interrupted.
+
+## [1.7.5] - 2026-08-30
+
+### Added
+
+- Add `--yes` (`-y`) to assume "yes" at every confirmation prompt without reading stdin, so scripted and CI runs are no longer silently declined by the large-search prompt.
+- Estimate the number of batches and the API time before searching, and ask for confirmation when a search exceeds 5,000 variations.
+- Retry rate-limited and transient API failures with exponential backoff, honouring both the numeric and HTTP-date forms of `Retry-After`, and send a proper `User-Agent` identifying the tool and its repository.
+
+### Changed
+
+- Report matches incrementally as each batch of results arrives instead of only after every batch has completed, so verbose output no longer appears minutes late on long searches.
+- Handle Ctrl+C during the search: the progress bar is closed, the matches found so far are printed as partial results, and the process exits with status 130.
+- Centralize batching and rate limiting inside `batch_check_observations`, and route all search output through the progress bar so tqdm's display is not corrupted.
+- Match genus and family through verified taxon IDs and observation ancestry. The genus name-prefix heuristic is now used only when no verified taxon ID is available; exact rank-and-name comparisons still apply.
+
+### Fixed
+
+- Exclude candidates with a leading zero and deduplicate candidates that resolve to the same numeric observation ID, so the reported variation counts match the IDs actually queried.
+- Deduplicate the final match list by observation ID so an observation is never reported twice.
+- Parse unquoted `--project` names correctly when followed by a short observation number, and accept scheme-less iNaturalist URLs.
+- Treat a 404 from the users endpoint as a clean "not found" instead of printing an API error.
+- Fall back from `/taxa/autocomplete` to `/taxa`, and from the direct project endpoint to a project search, when the first lookup returns nothing.
+- URL-encode user and project identifiers before putting them into API paths.
+- Skip the redundant second lookup of the original observation number when `--digits 0` leaves it as the only candidate.
+
+## [1.7.4] - 2026-08-30
+
+### Added
+
+- Add `--family` as a search criterion, using iNaturalist taxon ancestry to match observations.
+
+### Fixed
+
+- Insert one missing digit at every position in observation numbers shorter than nine digits, instead of checking only the beginning and end. Thanks to Elora for the feedback!
+
 ## [1.7.3] - 2026-08-29
 
 ### Fixed
