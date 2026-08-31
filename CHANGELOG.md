@@ -2,11 +2,50 @@
 
 All notable changes to the inat.finder.py project will be documented in this file.
 
+## [1.7.5] - 2026-08-30
+
+### Added
+
+- `--taxon-id ID` searches by an iNaturalist taxon ID instead of a name. It matches that taxon and everything below it, so you can search any rank - order, tribe, section, subspecies - and it is the way to pick between two taxa that share a name. Example: `python inat_finder.py --taxon-id 48419 123456789`
+- `--yes` (`-y`) answers "yes" at every prompt without reading the keyboard, so the tool can run unattended from a script, a scheduled job, or a GUI.
+- Search results now show each observation's location alongside its taxon, creator and link.
+- When a genus or family name belongs to more than one taxon - Prunella is both a plant and a bird - the tool stops instead of guessing. It lists every candidate with its taxon ID, and prints the exact `--taxon-id` command to re-run with the one you want.
+- Before starting, the tool reports how many variations it will check and roughly how long that will take. It asks for confirmation above 5,000 variations, and refuses searches too large to ever finish.
+- Missing digits are now tried in the middle of a number, not only at the ends, and adjacent digits are swapped to catch a number typed out of order (123456789 -> 123465789).
+- The exit codes are documented, so scripts and GUIs can act on them: `0` the search finished, `1` bad input or an unknown genus, family, taxon, user or project, `2` iNaturalist could not be reached, `130` cancelled with Ctrl+C. A command-line syntax error, such as two conflicting search criteria, also exits `2` but writes a usage message to stderr.
+
+### Changed
+
+- Matches are shown as each batch of results comes back, instead of only after the whole search has finished.
+- Ctrl+C now stops cleanly: it prints the matches found so far and exits with status 130.
+- Genus and family are matched through the verified taxon ID and the observation's place in the taxonomy rather than by name, so a same-named taxon in another kingdom is no longer a false match.
+- The progress bar counts only the variations that were really checked, and shows any that could not be checked as a separate total.
+- Very large searches no longer build their whole list of variations up front, so a high `--digits` cannot exhaust memory.
+- Every request - name lookups, the first check of your number, and the search itself - now shares one request-per-second limit, and rate-limited or failed requests are retried automatically.
+
+### Fixed
+
+- A search whose requests failed is never reported as "no matches". The tool says the search was incomplete, still shows what it did find, and exits with status 2.
+- A network or server problem while checking a genus, family, taxon, user or project is reported as a connection problem, not as "not found".
+- If the observation number you supplied already matches and you choose to keep searching, it now appears in the final results - exactly once.
+- A sustained outage stops the search early instead of grinding through every remaining batch.
+- An unquoted `--project` title that ends in a number now explains how it was read and suggests quoting it.
+
+## [1.7.4] - 2026-08-30
+
+### Added
+
+- `--family NAME` searches by family, alongside `--genus`, `--user` and `--project`. Matching follows the observation's place in the iNaturalist taxonomy.
+
+### Fixed
+
+- Missing digits are now tried at every position in numbers shorter than nine digits, not only at the beginning and end. Thanks to Elora for the feedback!
+
 ## [1.7.3] - 2026-08-29
 
 ### Fixed
 
-- Make `--digits N` search observations with one through N changed digits, matching its documented "up to N" behavior.
+- `--digits N` now searches numbers with one through N wrong digits, which is what "up to N" was always meant to do. Previously it only tried exactly N.
 
 ## [1.7.2] - 2026-06-04
 
