@@ -2,7 +2,13 @@
 
 **Version:** 1.7.5
 **Author:** Alan Rockefeller
-**Release Date:** August 30, 2026
+**Release Date:** September 1, 2026
+
+## Use it online - no installation required
+
+You can run this tool in your browser at **[dikarya.us/finder](https://dikarya.us/finder)** - no Python, no downloads, no setup.
+
+The instructions below are for those who prefer to run the command-line version locally.
 
 ## Overview
 
@@ -13,6 +19,8 @@ Since you probably are using this code because you have a DNA barcode which does
 This tool is particularly useful for sequence validators, researchers and iNaturalist power users who need to find specific observations but have encountered typos in their reference numbers.
 
 A Windows .exe is available [here](https://github.com/AlanRockefeller/inat.finder.py/releases)
+
+![iNaturalist observation finder screenshot](iNaturalist%20observation%20finder%20screenshot.png)
 
 ## Features
 
