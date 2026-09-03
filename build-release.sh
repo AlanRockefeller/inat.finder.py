@@ -132,20 +132,37 @@ if [ -n "$dirty" ]; then
   die "working tree has uncommitted changes; commit or stash before building a release"
 fi
 
+validate_github_remote_url() {
+  local label="$1"
+  local url="$2"
+  [ -n "$url" ] || die "remote 'origin' has an empty ${label}"
+  case "$url" in
+    https://github.com/?*) ;;
+    git@github.com:?*) ;;
+    ssh://git@github.com/?*) ;;
+    http://*)
+      die "remote 'origin' ${label} uses plaintext HTTP; use an HTTPS or SSH GitHub remote: $url"
+      ;;
+    *)
+      die "remote 'origin' ${label} must be an HTTPS or SSH GitHub remote: $url"
+      ;;
+  esac
+}
+
 remote_url="$(git remote get-url origin 2>/dev/null)" \
   || die "remote 'origin' is not configured"
-[ -n "$remote_url" ] || die "remote 'origin' has an empty URL"
-case "$remote_url" in
-  https://github.com/?*) ;;
-  git@github.com:?*) ;;
-  ssh://git@github.com/?*) ;;
-  http://*)
-    die "remote 'origin' uses plaintext HTTP; use an HTTPS or SSH GitHub remote: $remote_url"
-    ;;
-  *)
-    die "remote 'origin' must be an HTTPS or SSH GitHub remote: $remote_url"
-    ;;
-esac
+validate_github_remote_url "URL" "$remote_url"
+
+# Pushes use remote.origin.pushurl when configured, so validate every push URL too.
+push_urls="$(git remote get-url --push --all origin 2>/dev/null)" \
+  || die "remote 'origin' has no push URL"
+[ -n "$push_urls" ] || die "remote 'origin' has an empty push URL"
+while IFS= read -r push_url; do
+  [ -n "$push_url" ] || continue
+  validate_github_remote_url "push URL" "$push_url"
+done <<EOF_PUSH_URLS
+$push_urls
+EOF_PUSH_URLS
 
 case "$target_ref" in
   origin/*)
