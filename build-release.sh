@@ -15,13 +15,18 @@ Note: PyInstaller only produces a binary for the platform it runs on. Run this
 on Windows (Git Bash) to produce inat_finder.exe; on Linux it produces a Linux
 binary. The tag and release are created either way.
 
+The tag must be v<VERSION from the target inat_finder.py>, so the executable,
+the tag and the release title always describe the same version. Re-running for
+another platform reuses an existing matching tag and uploads to its release.
+The executable is copied to ./release-artifacts/.
+
 Defaults:
   --target origin/Main
   --tag    v<VERSION from inat_finder.py>
 
 Examples:
   ./build-release.sh
-  ./build-release.sh --tag v1.7.6
+  ./build-release.sh --tag v1.7.5
   ./build-release.sh --dry-run
 USAGE
 }
@@ -45,6 +50,8 @@ skip_ruff=false
 skip_tests=false
 no_upload=false
 temp_dir=""
+release_dir_name="release-artifacts"
+release_dir="${repo_root}/${release_dir_name}"
 
 cleanup() {
   if [ -n "$temp_dir" ] && [ -d "$temp_dir" ]; then
@@ -119,11 +126,26 @@ target_file_contains() {
   show_target_file "$path" | grep -Fq "$needle"
 }
 
-if [ -n "$(git status --porcelain)" ]; then
+# Ignore our own output directory so a previous build does not block the next one.
+dirty="$(git status --porcelain | grep -v "^?? ${release_dir_name}/\\?$" || true)"
+if [ -n "$dirty" ]; then
   die "working tree has uncommitted changes; commit or stash before building a release"
 fi
 
-git remote get-url origin >/dev/null 2>&1 || die "remote 'origin' is not configured"
+remote_url="$(git remote get-url origin 2>/dev/null)" \
+  || die "remote 'origin' is not configured"
+[ -n "$remote_url" ] || die "remote 'origin' has an empty URL"
+case "$remote_url" in
+  https://github.com/?*) ;;
+  git@github.com:?*) ;;
+  ssh://git@github.com/?*) ;;
+  http://*)
+    die "remote 'origin' uses plaintext HTTP; use an HTTPS or SSH GitHub remote: $remote_url"
+    ;;
+  *)
+    die "remote 'origin' must be an HTTPS or SSH GitHub remote: $remote_url"
+    ;;
+esac
 
 case "$target_ref" in
   origin/*)
@@ -149,19 +171,31 @@ if [ -z "$tag" ]; then
   tag="v${version}"
 fi
 
-case "$tag" in
-  v*) ;;
-  *) die "tag must start with 'v': $tag" ;;
-esac
+[ "$tag" = "v${version}" ] \
+  || die "tag must match the target version: expected v${version}, got $tag"
 
 git check-ref-format "refs/tags/$tag" || die "invalid git tag name: $tag"
 
+# An existing tag is fine as long as it already points at the target commit; that
+# is how a second platform (e.g. Windows) adds its executable to the same release.
+local_tag_exists=false
 if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
-  die "local tag already exists: $tag"
+  existing_sha="$(git rev-parse "refs/tags/${tag}^{commit}")"
+  [ "$existing_sha" = "$target_sha" ] \
+    || die "local tag $tag already exists and points at $existing_sha, not $target_sha"
+  local_tag_exists=true
 fi
 
-if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
-  die "remote tag already exists: $tag"
+remote_tag_sha="$(git ls-remote origin "refs/tags/${tag}^{}" | awk 'NR==1{print $1}')"
+if [ -z "$remote_tag_sha" ]; then
+  remote_tag_sha="$(git ls-remote origin "refs/tags/${tag}" | awk 'NR==1{print $1}')"
+fi
+remote_tag_exists=false
+if [ -n "$remote_tag_sha" ]; then
+  [ "$remote_tag_sha" = "$target_sha" ] \
+    || die "remote tag $tag already exists and points at $remote_tag_sha, not $target_sha"
+  remote_tag_exists=true
+  note "Tag $tag already exists on origin at the target commit; reusing it"
 fi
 
 target_file_contains inat_finder.py 'VERSION = "' \
@@ -173,15 +207,11 @@ target_file_contains README.md "**Version:** ${version}" \
 target_file_contains CHANGELOG.md "${version}" \
   || die "target CHANGELOG.md has no entry for version ${version}"
 
-# Work from a pristine copy of the target commit unless it is already checked out.
-head_sha="$(git rev-parse HEAD^{commit})"
-if [ "$target_sha" = "$head_sha" ]; then
-  build_dir="$repo_root"
-else
-  temp_dir="$(mktemp -d)"
-  git archive "$target_sha" | tar -x -C "$temp_dir"
-  build_dir="$temp_dir"
-fi
+# Always build from a pristine copy of the target commit so PyInstaller's dist,
+# build and spec output never lands in the checked-out worktree.
+temp_dir="$(mktemp -d)"
+git archive "$target_sha" | tar -x -C "$temp_dir"
+build_dir="$temp_dir"
 
 python_bin="$(find_venv_python)" || python_bin=""
 if [ -n "$python_bin" ]; then
@@ -212,9 +242,8 @@ else
   note "Skipping tests"
 fi
 
-remote_url="$(git remote get-url origin)"
 repo_slug="$(printf '%s\n' "$remote_url" \
-  | sed -E 's#^git@github.com:##; s#^https://github.com/##; s#\.git$##')"
+  | sed -E 's#^git@github.com:##; s#^ssh://git@github.com/##; s#^https://github.com/##; s#\.git$##')"
 repo_url="https://github.com/${repo_slug}"
 
 note "Release tag: $tag"
@@ -245,21 +274,33 @@ note "Building one-file executable with PyInstaller"
     inat_finder.py
 )
 
-artifact="${dist_dir}/inat_finder"
-if [ -f "${artifact}.exe" ]; then
-  artifact="${artifact}.exe"
+built="${dist_dir}/inat_finder"
+if [ -f "${built}.exe" ]; then
+  built="${built}.exe"
 fi
-[ -f "$artifact" ] || die "PyInstaller did not produce an executable in $dist_dir"
+[ -f "$built" ] || die "PyInstaller did not produce an executable in $dist_dir"
+
+# The build directory is deleted on exit, so keep the executable somewhere stable.
+mkdir -p "$release_dir"
+artifact="${release_dir}/$(basename "$built")"
+cp "$built" "$artifact"
 note "Built $artifact"
 
-git tag -a "$tag" "$target_sha" -m "inat_finder ${version} (${tag})"
-git push origin "refs/tags/$tag"
+if [ "$local_tag_exists" = false ]; then
+  git tag -a "$tag" "$target_sha" -m "inat_finder ${version} (${tag})"
+fi
+if [ "$remote_tag_exists" = false ]; then
+  git push origin "refs/tags/$tag"
+fi
 
 if [ "$no_upload" = true ]; then
   note "Skipping GitHub Release upload (--no-upload)"
 elif ! command -v gh >/dev/null 2>&1; then
   note "gh CLI not found; tag pushed but no release created"
   note "Upload manually: ${repo_url}/releases/new?tag=${tag}"
+elif gh release view "$tag" --repo "$repo_slug" >/dev/null 2>&1; then
+  note "Uploading $(basename "$artifact") to existing GitHub Release $tag"
+  gh release upload "$tag" "$artifact" --repo "$repo_slug" --clobber
 else
   note "Creating GitHub Release $tag and uploading $(basename "$artifact")"
   gh release create "$tag" "$artifact" \
@@ -270,13 +311,13 @@ fi
 
 cat <<EOF
 
-Pushed $tag and built:
+Tag $tag is published and the executable was built:
   $artifact
 
 Release page:
   ${repo_url}/releases/tag/${tag}
 
 Reminder: PyInstaller builds only for the host platform. To publish the Windows
-.exe advertised in the README, re-run this script on Windows and upload the
-resulting dist/inat_finder.exe to the same release.
+.exe advertised in the README, re-run this script on Windows; it will reuse this
+tag and upload inat_finder.exe to the same release.
 EOF
