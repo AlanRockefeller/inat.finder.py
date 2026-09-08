@@ -2,7 +2,7 @@
 
 All notable changes to the inat.finder.py project will be documented in this file.
 
-## [1.7.5] - 2026-08-30
+## [1.7.5] - 2026-09-01
 
 ### Added
 
