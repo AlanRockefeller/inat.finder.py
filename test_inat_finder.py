@@ -29,6 +29,7 @@ from inat_finder import (
     parse_inat_url,
     parse_resume_token,
     preprocess_argv_for_project_name,
+    rank_matches,
     restore_seen_ids,
     unique_by_integer_value,
 )
@@ -2775,21 +2776,24 @@ class TestAutoModeLadder(AutoModeMixin, unittest.TestCase):
         self.assertIn("Observation #123456700", output)
         self.assertIn("Found at stage 2", output)
 
-    def test_full_match_stops_before_the_next_batch(self):
-        """The point of intra-stage stopping: a hit must not cost the whole stage."""
+    def test_a_small_stage_is_finished_after_a_full_match(self):
+        """A hit early in a cheap stage must not hide the rest of that stage.
+
+        With one clue every hit is a full match, and iNaturalist numbers run in
+        upload order, so the first hit is routinely a neighbour by the same person
+        rather than the observation being looked for. The stage runs to the end and
+        both candidates are reported.
+        """
         stage_one = {int(value) for value in build_candidate_plan("123456789", 1)}
-        early = next(
+        stage_two = [
             value
             for value in build_candidate_plan("123456789", 2)
             if int(value) not in stage_one
-        )
-        # A second observation shares the batch and must still be reported.
-        companion = next(
-            value
-            for value in build_candidate_plan("123456789", 2)
-            if int(value) not in stage_one and value != early
-        )
-        fetch, calls = self.fetcher({int(early), int(companion)})
+        ]
+        early = stage_two[0]
+        # Deliberately in a later batch than `early`, which used to end the stage.
+        late = stage_two[inat_finder.BATCH_SIZE + 5]
+        fetch, calls = self.fetcher({int(early), int(late)})
         status, output = self.run_main(
             [
                 "inat_finder.py",
@@ -2806,8 +2810,60 @@ class TestAutoModeLadder(AutoModeMixin, unittest.TestCase):
             },
         )
         self.assertEqual(status, 0)
-        # Stage 0, all of stage 1, then exactly one batch of stage 2.
-        self.assertEqual(len(calls), 3)
+        self.assertIn(f"Observation #{int(early)}", output)
+        self.assertIn(f"Observation #{int(late)}", output)
+        self.assertNotIn("because a full match was found", output)
+        # Stage 0, stage 1, then every batch of stage 2 - not just the first.
+        stage_two_batches = (
+            len(stage_two) + inat_finder.BATCH_SIZE - 1
+        ) // inat_finder.BATCH_SIZE
+        self.assertEqual(len(calls), 2 + stage_two_batches)
+        # And it still stops there rather than climbing to stage 3.
+        self.assertNotIn("Stage 3", output)
+
+    def test_full_match_stops_before_the_next_batch_in_a_large_stage(self):
+        """Intra-stage stopping survives where finishing would cost minutes."""
+        stage_two = {int(value) for value in build_candidate_plan("123456789", 2)}
+        stage_three = [
+            value
+            for value in build_candidate_plan("123456789", 3)
+            if int(value) not in stage_two
+        ]
+        self.assertGreater(len(stage_three), inat_finder.EARLY_STOP_MIN_CANDIDATES)
+        early = stage_three[0]
+        # A second observation shares the batch and must still be reported.
+        companion = stage_three[1]
+        fetch, calls = self.fetcher({int(early), int(companion)})
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+                "--yes",
+                "--digits",
+                "3",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        # Stage 0, all of stage 1 and 2, then exactly one batch of stage 3.
+        def batches(count):
+            return (count + inat_finder.BATCH_SIZE - 1) // inat_finder.BATCH_SIZE
+
+        stage_one_total = build_candidate_plan("123456789", 1).total
+        expected = (
+            1
+            + batches(stage_one_total)
+            + batches(len(stage_two) - stage_one_total)
+            + 1
+        )
+        self.assertEqual(len(calls), expected)
         self.assertLessEqual(len(calls[-1]["ids"]), inat_finder.BATCH_SIZE)
         self.assertIn(f"Observation #{int(early)}", output)
         self.assertIn(f"Observation #{int(companion)}", output)
@@ -2913,6 +2969,173 @@ class TestAutoModeLadder(AutoModeMixin, unittest.TestCase):
             inat_finder.auto_stage_label(2, build_candidate_plan("123456789", 2)),
             "two substituted digits and extra digits",
         )
+
+
+class TestAutoModeRanking(AutoModeMixin, unittest.TestCase):
+    """Equal scores are the normal case, so the tie-break has to mean something."""
+
+    def test_equal_scores_are_ordered_by_stage_then_closeness(self):
+        """With one clue every hit scores 1 of 1; ID order would be arbitrary.
+
+        The three IDs here are chosen so that the answer differs under each rule:
+        ascending ID would put the far one first, and closeness alone would put a
+        stage-2 candidate ahead of a stage-1 one.
+        """
+        stage_one = [int(value) for value in build_candidate_plan("123456789", 1)]
+        stage_two = [
+            int(value)
+            for value in build_candidate_plan("123456789", 2)
+            if int(value) not in set(stage_one)
+        ]
+        near_stage_one = min(stage_one, key=lambda value: abs(value - 123456789))
+        far_stage_one = max(stage_one, key=lambda value: abs(value - 123456789))
+        near_stage_two = min(stage_two, key=lambda value: abs(value - 123456789))
+        self.assertLess(
+            abs(near_stage_two - 123456789), abs(far_stage_one - 123456789)
+        )
+
+        fetch, _calls = self.fetcher({near_stage_one, far_stage_one, near_stage_two})
+        status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--user",
+                "observer",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            {
+                "verify_user_exists": Mock(return_value=True),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        found = [entry["id"] for entry in result["matches"]]
+        # Stage 1 finishes, so both of its hits are here; stage 2 never runs.
+        expected = sorted(
+            [near_stage_one, far_stage_one], key=lambda value: abs(value - 123456789)
+        )
+        self.assertEqual(found, expected)
+        self.assertNotIn(near_stage_two, found)
+
+    def test_the_original_number_outranks_an_equally_scoring_neighbour(self):
+        """Stage 0 is distance zero, so nothing can tie-break ahead of it."""
+        neighbour = 123456788
+        fetch, _calls = self.fetcher({123456789, neighbour})
+        status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--user",
+                "observer",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            {
+                "verify_user_exists": Mock(return_value=True),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(result["matches"][0]["id"], 123456789)
+
+    def test_rank_matches_without_an_origin_falls_back_to_id_order(self):
+        matches = [
+            inat_finder.ScoredMatch({"id": 30}, ["user"], [], 1),
+            inat_finder.ScoredMatch({"id": 10}, ["user"], [], 1),
+            inat_finder.ScoredMatch({"id": 20}, ["user", "genus"], [], 2),
+        ]
+        ranked = [match.observation["id"] for match in rank_matches(matches)]
+        self.assertEqual(ranked, [20, 10, 30])
+
+    def test_rank_matches_sorts_a_stageless_match_last_among_equals(self):
+        """A non-auto search leaves stage None; math.inf must not raise or win."""
+        matches = [
+            inat_finder.ScoredMatch({"id": 10}, ["user"], [], None),
+            inat_finder.ScoredMatch({"id": 30}, ["user"], [], 2),
+            inat_finder.ScoredMatch({"id": 20}, ["user"], [], 1),
+        ]
+        ranked = [match.observation["id"] for match in rank_matches(matches)]
+        self.assertEqual(ranked, [20, 30, 10])
+
+
+class TestAutoModeSingleClueWarning(AutoModeMixin, unittest.TestCase):
+    """One clue cannot separate neighbours, and the tool has to say so."""
+
+    def test_several_full_matches_on_one_clue_are_called_a_ranking(self):
+        stage_one = [int(value) for value in build_candidate_plan("123456789", 1)]
+        fetch, _calls = self.fetcher(set(stage_one[:3]))
+        status, result, output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--user",
+                "observer",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            {
+                "verify_user_exists": Mock(return_value=True),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(len(result["matches"]), 3)
+        self.assertTrue(
+            any("best guess rather than an answer" in notice
+                for notice in result["notices"]),
+            result["notices"],
+        )
+        self.assertIn("the order they were uploaded", output)
+
+    def test_a_single_full_match_is_not_hedged(self):
+        fetch, _calls = self.fetcher({123456788})
+        status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--user",
+                "observer",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            {
+                "verify_user_exists": Mock(return_value=True),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(len(result["matches"]), 1)
+        self.assertEqual(result["notices"], [])
+
+    def test_two_clues_do_not_trigger_the_warning(self):
+        stage_one = [int(value) for value in build_candidate_plan("123456789", 1)]
+        fetch, _calls = self.fetcher(set(stage_one[:3]))
+        status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "--user",
+                "observer",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "verify_user_exists": Mock(return_value=True),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(len(result["matches"]), 3)
+        self.assertEqual(result["notices"], [])
 
 
 class TestAutoModeClues(AutoModeMixin, unittest.TestCase):
@@ -3220,6 +3443,9 @@ class TestAutoModeResume(AutoModeMixin, unittest.TestCase):
             if int(value) not in stage_one
         )
         fetch, first_calls = self.fetcher({int(early)})
+        # --digits 3, because stage 2 is now finished rather than abandoned at the
+        # hit: the cursor it hands back points at the start of stage 3, and a cap
+        # of 2 would leave nothing for the resume to do.
         status, first_result, _output = self.run_main_json(
             [
                 "inat_finder.py",
@@ -3230,7 +3456,7 @@ class TestAutoModeResume(AutoModeMixin, unittest.TestCase):
                 "--no-progress",
                 "--yes",
                 "--digits",
-                "2",
+                "3",
             ],
             {
                 "find_taxon": Mock(return_value=GENUS_TAXON),
@@ -3240,7 +3466,8 @@ class TestAutoModeResume(AutoModeMixin, unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(first_result["status"], "match_found")
         token = first_result["resume"]["token"]
-        self.assertEqual(first_result["resume"]["stage"], 2)
+        self.assertEqual(first_result["resume"]["stage"], 3)
+        self.assertEqual(first_result["resume"]["offset"], 0)
 
         fetch_again, second_calls = self.fetcher(set())
         status, second_result, output = self.run_main_json(
@@ -3253,7 +3480,7 @@ class TestAutoModeResume(AutoModeMixin, unittest.TestCase):
                 "--no-progress",
                 "--yes",
                 "--digits",
-                "2",
+                "3",
                 "--auto-resume",
                 token,
             ],
@@ -3263,10 +3490,11 @@ class TestAutoModeResume(AutoModeMixin, unittest.TestCase):
             },
         )
         self.assertEqual(status, 0)
-        self.assertIn("Resuming at stage 2", output)
+        self.assertIn("Resuming at stage 3", output)
         self.assertEqual(second_result["status"], "no_match")
-        # Stage 0 and stage 1 are replayed offline, not re-requested.
+        # Stages 0 to 2 are replayed offline, not re-requested.
         self.assertNotIn("Stage 1", output)
+        self.assertNotIn("Stage 2", output)
         first_ids = set(self.requested_ids(first_calls))
         second_ids = set(self.requested_ids(second_calls))
         self.assertTrue(second_ids)

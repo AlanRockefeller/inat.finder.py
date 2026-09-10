@@ -1,6 +1,6 @@
 # inat.finder.py
 
-**Version:** 1.8.0
+**Version:** 1.8.1
 **Author:** Alan Rockefeller
 **Release Date:** September 10, 2026
 
@@ -167,8 +167,8 @@ python inat_finder.py --genus Boletus 123456789 --verbose
 Auto mode exists for foray and DNA-barcoding work, where a sequence points at an
 iNaturalist number that does not resolve and you are left guessing which knob to
 turn. Instead of re-running the tool by hand with a wider `--digits`, then again
-without the genus, `--auto` works through the hypotheses for you and stops as soon
-as it finds an observation that matches everything you told it.
+without the genus, `--auto` works through the hypotheses for you and stops at the
+first stage that turns up an observation matching everything you told it.
 
 ```bash
 python inat_finder.py --auto --genus Cystoderma 187067127
@@ -198,6 +198,13 @@ least one clue, and the ones matching the most clues come first:
 If nothing matched every clue, the tool says so - a partial match usually means one
 of the elements you supplied is the wrong one.
 
+**One clue on its own is weak evidence.** iNaturalist hands out observation numbers
+in the order things are uploaded, so the numbers either side of a mistyped one very
+often belong to the same person, and frequently to the same species. A search with
+only `--user` or only `--genus` will often find several neighbours that all match
+perfectly. Auto mode lists all of them and warns you rather than picking one. Add a
+second clue when you can.
+
 ### The ladder
 
 | Stage | What it searches                                                                    |
@@ -212,9 +219,15 @@ across the whole ladder, and each stage prints how many new candidates it holds 
 the counts depend on the digits in your number, so they are printed rather than
 documented.
 
-The search stops the moment a batch contains a full match, part-way through a stage
-rather than at the end of it, so a hit in the first 200 candidates of stage 3 costs
-one request instead of seven minutes.
+When a stage turns up a full match, that whole stage is checked before the search
+stops. You get every observation that matched equally well, instead of only the one
+that happened to be looked at first. This is cheap: stage 1 of a nine-digit number
+is 133 candidates, a single request.
+
+Stages holding more than 5,000 candidates are the exception. Those still stop as
+soon as a batch contains a full match, part-way through the stage, so a hit in the
+first 200 candidates of stage 3 costs one request instead of several minutes. If
+that answer looks wrong, the resume token carries on through the rest of the stage.
 
 ### Stopping and continuing
 

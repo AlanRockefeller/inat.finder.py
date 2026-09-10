@@ -2,6 +2,15 @@
 
 All notable changes to the inat.finder.py project will be documented in this file.
 
+## [1.8.1] - 2026-09-10
+
+### Fixed
+
+- Auto mode used to stop the instant it found an observation matching every clue, and often that was the wrong observation. iNaturalist hands out observation numbers in the order things are uploaded, so the numbers on either side of a mistyped one very often belong to the same person, and frequently to the same species. If you searched with only `--user` or only `--genus`, one of those neighbours would match, the search would stop, and the observation you were actually looking for was never checked. Auto mode now finishes the stage it is working on before it stops, so you get every observation that matched, not just the first one it happened to hit. This costs about a second on the first stage of a nine-digit number.
+- Stages with more than 5,000 candidates still stop as soon as a batch contains a full match, because finishing one of those takes minutes rather than seconds. If the answer it found looks wrong, the resume token it prints will carry on through the rest of that stage.
+- When several observations match equally well, the list used to be ordered by observation number, which meant the one at the top was arbitrary. Results that tie are now ordered by how few digits had to change, then by how close the number is to the one you typed. The number you supplied, if it matched, always comes first.
+- If you search with a single clue and more than one nearby observation matches it, the tool now says so instead of presenting the first result as if it were the answer. It explains that consecutive numbers usually belong to the same person and suggests adding a second clue.
+
 ## [1.8.0] - 2026-09-10
 
 ### Added
