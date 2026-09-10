@@ -2,7 +2,7 @@
 """
 iNaturalist Observation Finder
 
-Version 1.8.0 - By Alan Rockefeller - September 9, 2026
+Version 1.8.1 - By Alan Rockefeller - September 10, 2026
 
 This script helps find the correct iNaturalist observation number when there are mistyped digits.
 It works by systematically changing digits of the provided observation number and checking if
@@ -21,10 +21,13 @@ The script can also parse observation numbers directly from iNaturalist URLs.
 Auto mode (--auto) turns the tool into one command for a foray: supply whichever
 clues you happen to have - genus, family, taxon ID, collector, project, any
 combination, or none - and it climbs a ladder of progressively wider typo
-hypotheses, stopping the moment it finds an observation that matches every clue.
-A clue that turns out to be wrong is reported and dropped rather than ending the
-search, because on a foray the mistaken element is as often the genus as the
-number.
+hypotheses, stopping after the first rung on which something matches every clue.
+It finishes that rung rather than stopping at the hit, so every equally good
+candidate is reported together and ranked; with a single clue the first hit is
+often a neighbouring observation by the same uploader rather than the one you
+want. A clue that turns out to be wrong is reported and dropped rather than
+ending the search, because on a foray the mistaken element is as often the genus
+as the number.
 
 Usage:
     python inat_finder.py (--genus NAME | --family NAME | --taxon-id ID | --user USER | --project PROJECT) OBSERVATION [options]
@@ -73,6 +76,7 @@ import enum
 import hashlib
 import itertools
 import json
+import math
 import re
 import sys
 import textwrap
@@ -85,7 +89,7 @@ from email.utils import parsedate_to_datetime
 import requests
 from tqdm import tqdm
 
-VERSION = "1.8.0"
+VERSION = "1.8.1"
 API_BASE_URL = "https://api.inaturalist.org/v1"
 BATCH_SIZE = 200
 REQUEST_TIMEOUT = 20
@@ -106,6 +110,17 @@ MAX_SEARCH_CANDIDATES = 1_000_000
 # The compatibility helper returns a real list, whose strings and references use
 # substantially more memory than the streamed CLI search. Keep its ceiling lower.
 MAX_EAGER_CANDIDATES = 100_000
+# Above this many candidates, an --auto stage stops at the batch that produced a
+# full match instead of finishing. Below it, the stage always runs to the end.
+#
+# Finishing is the default because "the first full match" is weak evidence here:
+# iNaturalist assigns observation IDs sequentially at upload, so the IDs either
+# side of a mistyped one very often share an uploader and frequently a taxon.
+# With a single clue, is_full_match() is satisfied by that coincidence, and the
+# stage used to abort on it while the real observation sat further down the same
+# stage, never requested. Checking the rest of a stage this size costs seconds;
+# reporting one confidently wrong observation costs the answer.
+EARLY_STOP_MIN_CANDIDATES = 5000
 OBSERVATION_FIELDS = "id,taxon,user,place_ids,place_guess"
 # How wide --auto is allowed to climb when --digits is not given explicitly.
 AUTO_DEFAULT_MAX_DIGITS = 3
@@ -2290,23 +2305,46 @@ STATUS_EXIT_CODES = {
 }
 
 
-def rank_matches(matches):
+def rank_matches(matches, origin=None):
     """Deduplicate by observation ID and sort best-first.
 
     An observation can be scored more than once - the original number may also
-    turn up as a candidate - so the highest-scoring copy wins. Ties break on ID so
-    the order is stable between runs, which matters for a page that diffs results.
+    turn up as a candidate - so the highest-scoring copy wins.
+
+    Score decides the order first. Everything after it exists because equal scores
+    are the common case, not the rare one: with a single clue every hit scores
+    1 of 1, so without a tie-break the "best" match would be whichever candidate
+    happened to have the lowest ID. Ties therefore break on the stage that found
+    the match (fewer digits off is a likelier typo), then on numeric distance from
+    the number the user actually typed, and only then on ID, which keeps the order
+    stable between runs - something a page that diffs results depends on.
+
+    Args:
+        origin: The observation number as supplied, if known. Only used for the
+            distance tie-break; without it that term is constant and the order
+            falls through to ID as before.
     """
+    try:
+        origin_value = int(origin) if origin is not None else None
+    except (TypeError, ValueError):
+        origin_value = None
+
     best = {}
     for match in matches:
         obs_id = match.observation.get("id")
         current = best.get(obs_id)
         if current is None or len(match.matched) > len(current.matched):
             best[obs_id] = match
-    return sorted(
-        best.values(),
-        key=lambda match: (-len(match.matched), match.observation.get("id") or 0),
-    )
+
+    def sort_key(match):
+        obs_id = match.observation.get("id") or 0
+        # A non-auto search leaves stage None; those sort after every staged
+        # match rather than ahead of stage 0.
+        stage = match.stage if match.stage is not None else math.inf
+        distance = abs(obs_id - origin_value) if origin_value is not None else 0
+        return (-len(match.matched), stage, distance, obs_id)
+
+    return sorted(best.values(), key=sort_key)
 
 
 def format_match_score(match, criteria):
@@ -2736,10 +2774,19 @@ def run_auto_mode(
 
     The ladder is stage 0 (the number exactly as supplied) then one plan per
     ``digits_off`` up to ``digits_cap``, each stage yielding only what earlier
-    stages did not already try. It stops at the first *full* match - one where
-    every usable clue agreed - because a partial match usually means one of the
-    clues is itself wrong, and that is worth widening the search to check. With a
-    single clue, full score is one, so this is exactly "stop at the first hit".
+    stages did not already try. It stops after the first stage that produced a
+    *full* match - one where every usable clue agreed - because a partial match
+    usually means one of the clues is itself wrong, and that is worth widening the
+    search to check.
+
+    It stops after the stage, not at the match. With a single clue a full match is
+    just one agreeing field, and IDs adjacent to a mistyped one routinely belong to
+    the same uploader, so the first hit is frequently a coincidence sitting in front
+    of the real observation later in the same stage. Finishing the stage collects
+    every equally-good candidate and hands the choice to the reader, ranked by
+    rank_matches(). Only a stage larger than ``EARLY_STOP_MIN_CANDIDATES`` keeps the
+    old abort-on-hit behaviour, where finishing would cost minutes rather than
+    seconds.
     """
     if message_callback is None:
         message_callback = print
@@ -2855,7 +2902,7 @@ def run_auto_mode(
         return SearchOutcome(
             status=status,
             stop_reason=reason,
-            matches=rank_matches(matches),
+            matches=rank_matches(matches, origin=obs_number),
             unusable=tuple(resolved.unusable),
             notices=tuple(notices),
             original=original,
@@ -3010,7 +3057,7 @@ def run_auto_mode(
                 stage_index=index,
                 project_id_param=resolved.project_id_param,
                 membership_project_id=resolved.membership_project_id,
-                stop_on_full_match=True,
+                stop_on_full_match=stage.total > EARLY_STOP_MIN_CANDIDATES,
                 show_progress=show_progress,
                 verbose=verbose,
                 message_callback=message_callback,
@@ -3034,10 +3081,26 @@ def run_auto_mode(
                 interrupted = True
                 break
 
-            if any(
-                is_full_match(match.matched, criteria) for match in result.matches
-            ):
+            full_here = [
+                match
+                for match in result.matches
+                if is_full_match(match.matched, criteria)
+            ]
+            if full_here:
                 stop_reason = "full_match"
+                if len(full_here) > 1 and len(criteria) == 1:
+                    # Worth saying plainly rather than leaving the reader to infer
+                    # it from a list: one clue cannot separate these, and nearby
+                    # IDs share an uploader far more often than chance.
+                    notices.append(
+                        f"{len(full_here)} nearby observations all match the only "
+                        f"clue you gave ({criteria[0].kind}), so the one listed "
+                        "first is a best guess rather than an answer. iNaturalist "
+                        "numbers observations in the order they were uploaded, so "
+                        "numbers next to each other often belong to the same "
+                        "person and the same taxon. Check all of them, or add a "
+                        "second clue."
+                    )
                 if stage.exhausted():
                     resume = cursor(index + 1, 0)
                 else:
