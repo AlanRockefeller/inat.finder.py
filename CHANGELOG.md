@@ -26,6 +26,9 @@ All notable changes to the inat.finder.py project will be documented in this fil
 - A stage too large to search is reported as an error rather than as "no matches found", since that stage was never searched.
 - Under `--json`, a genus, family, taxon, user or project that does not exist in a normal (non-`--auto`) search now reports _why_ in the result object, instead of leaving the explanation on stderr and handing the caller an error with no message.
 - A cancelled search reports the candidates its stage had really checked, rather than zero, so a progress display stays honest after Ctrl+C.
+- With `--auto --project` and no other clue, the number as supplied is now looked up unfiltered and its project membership asked separately. An observation that exists but is not a member was previously reported as not existing at all, with nothing in the JSON `original` field to show what the number really pointed at.
+- A normal (non-`--auto`) search that stops because you declined to keep looking no longer reports itself as a completed, exhausted search. The variations were never checked, so the result says `declined` and `complete` is false - in both the JSON and the printed summary, which no longer says "Search complete!" or offers advice about why nothing was found.
+- A normal search's JSON result now fills in `original` with the observation the supplied number actually points at, matching or not, instead of always `null`. A front end can show what the number references even when it belongs to a different taxon or observer.
 
 ## [1.7.5] - 2026-09-01
 

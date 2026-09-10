@@ -2679,13 +2679,17 @@ def check_original_observation(obs_number, resolved, message_callback=None):
     ``membership_unknown`` means the observation came back but its project
     membership could not be checked - reported separately because it leaves the
     search incomplete just as surely, and stage 0 is never re-run on a resume.
+
+    Unlike the later stages, this request is never filtered by project. Stage 0
+    asks "what is this number?", and a project filter answers a different
+    question: it would hide a real observation that simply is not a member,
+    leaving the run to report it as nonexistent. Membership is asked separately
+    so that "not in the project" stays distinct from "not there at all".
     """
     if message_callback is None:
         message_callback = print
     try:
-        found = fetch_observations(
-            [obs_number], project_id=resolved.project_id_param
-        )
+        found = fetch_observations([obs_number])
     except ApiError as error:
         message_callback(
             f"Warning: could not check the original observation number - {error}"
@@ -2698,18 +2702,11 @@ def check_original_observation(obs_number, resolved, message_callback=None):
     observation = found[0]
     membership_unknown = False
     context = BatchContext()
-    if resolved.project_id_param:
-        context = BatchContext(
-            project_member_ids={
-                str(item.get("id")) for item in found if item.get("id") is not None
-            }
-        )
-    elif resolved.membership_project_id:
+    project_id = resolved.project_id_param or resolved.membership_project_id
+    if project_id:
         try:
             context = BatchContext(
-                project_member_ids=fetch_project_membership(
-                    [obs_number], resolved.membership_project_id
-                )
+                project_member_ids=fetch_project_membership([obs_number], project_id)
             )
         except ApiError as error:
             # Stage 0 is not repeated when a search resumes, so an unanswered
@@ -3309,27 +3306,31 @@ def execute_search(args, sink=None):
         if sink is not None and recorded:
             sink["result"] = build_json_result(recorded[0], recorded[1])
 
-    def set_json_status(name):
-        """Correct the recorded JSON status without touching the text output.
+    def print_summary(
+        found,
+        interrupted=False,
+        unchecked=0,
+        message_callback=print,
+        original=None,
+        declined=False,
+    ):
+        """Print the deduplicated match list, search state, and elapsed time.
 
-        A couple of return paths exit 2 because the *original* check failed, while
-        the summary they printed was about the rest of the search. The text is
-        right as it stands; only the machine-readable status needs the note.
+        ``original`` is the observation the supplied number really points at, when
+        one came back, so a JSON consumer can show what that number references
+        whether or not it matched the search criteria. ``declined`` marks the exits
+        where the user stopped before the variations were checked: those results
+        are real, but the search did not run to a conclusion and may not claim to
+        have exhausted anything.
         """
-        if recorded:
-            recorded[0] = recorded[0]._replace(
-                status=name,
-                complete=outcome_is_complete(name, recorded[0].stop_reason),
-                exit_code=STATUS_EXIT_CODES.get(name, 1),
-            )
-
-    def print_summary(found, interrupted=False, unchecked=0, message_callback=print):
-        """Print the deduplicated match list, search state, and elapsed time."""
         # Defensive API-result deduplication: an ID should only be reported once.
         # This also collapses the original observation if a candidate returned it.
         deduplicated = list({match.get("id"): match for match in found}.values())
+        # The supplied observation is reported in its own field even when it did
+        # not match, so its location has to be resolved alongside the matches.
         location_labels = resolve_observation_locations(
-            deduplicated, message_callback=message_callback
+            deduplicated + ([original] if original is not None else []),
+            message_callback=message_callback,
         )
         if interrupted:
             json_status, json_reason = "cancelled", "interrupted"
@@ -3339,6 +3340,10 @@ def execute_search(args, sink=None):
             json_status, json_reason = "match_found", "exhausted"
         else:
             json_status, json_reason = "no_match", "exhausted"
+        if declined and json_reason == "exhausted":
+            # Nothing but the number as supplied was ever checked, so the
+            # unsearched variations must not be reported as conclusively absent.
+            json_reason = "declined"
         recorded[:] = [
             SearchOutcome(
                 status=json_status,
@@ -3348,6 +3353,7 @@ def execute_search(args, sink=None):
                     for observation in deduplicated
                 ),
                 notices=tuple(notices),
+                original=original,
                 unchecked=unchecked,
                 criteria=tuple(resolved.criteria),
                 complete=outcome_is_complete(json_status, json_reason),
@@ -3360,6 +3366,8 @@ def execute_search(args, sink=None):
             print("\nSearch interrupted!")
         elif unchecked:
             print("\nSearch incomplete - results may be incomplete.")
+        elif declined:
+            print("\nSearch stopped at your request - the variations were not checked.")
         else:
             print("\nSearch complete!")
 
@@ -3393,6 +3401,11 @@ def execute_search(args, sink=None):
             print(
                 "Because part of the search did not run, a matching observation may "
                 "still exist. Please try again."
+            )
+        elif declined:
+            print(
+                "\nNo matches found. The variations were never checked, so a "
+                "matching observation may still exist."
             )
         else:
             print("\nNo matches found. Consider these possibilities:")
@@ -3443,6 +3456,9 @@ def execute_search(args, sink=None):
     # In other modes, we need to check check_observation_* functions.
 
     original_match = None
+    # What the supplied number actually references, whether or not it matched.
+    # Reported in its own JSON field so a caller can show it either way.
+    original_observation = original_check[0] if original_check else None
 
     if original_check:
         match_found = False
@@ -3493,11 +3509,15 @@ def execute_search(args, sink=None):
             if not confirm("Continue searching for other potential matches? (y/n): "):
                 print("Exiting search.")
                 # The original observation is a real match and must be reported.
-                print_summary([original_match])
-                if original_check_failed:
-                    set_json_status("incomplete")
+                # Reaching here means the original lookup succeeded, so the only
+                # thing left unresolved is the variations the user declined.
+                print_summary(
+                    [original_match],
+                    original=original_observation,
+                    declined=True,
+                )
                 emit_recorded()
-                return API_FAILURE_EXIT_CODE if original_check_failed else 0
+                return 0
         elif search_mode == "taxon_id":
             print(
                 f"The original observation #{obs.get('id', obs_number)} exists but "
@@ -3568,6 +3588,7 @@ def execute_search(args, sink=None):
             print_summary(
                 [original_match] if original_match else [],
                 unchecked=1 if original_check_failed else 0,
+                original=original_observation,
             )
             emit_recorded()
             return API_FAILURE_EXIT_CODE if original_check_failed else 0
@@ -3596,10 +3617,12 @@ def execute_search(args, sink=None):
         f"This is a large search ({total_variations} variations). Continue? (y/n): "
     ):
         print("Exiting search.")
-        if original_match:
-            print_summary([original_match])
-        if original_check_failed:
-            set_json_status("incomplete")
+        print_summary(
+            [original_match] if original_match else [],
+            unchecked=1 if original_check_failed else 0,
+            original=original_observation,
+            declined=True,
+        )
         emit_recorded()
         return API_FAILURE_EXIT_CODE if original_check_failed else 0
 
@@ -3723,7 +3746,12 @@ def execute_search(args, sink=None):
     if interrupted:
         print("\nSearch cancelled - reporting the matches found so far.")
 
-    print_summary(matches, interrupted=interrupted, unchecked=unchecked)
+    print_summary(
+        matches,
+        interrupted=interrupted,
+        unchecked=unchecked,
+        original=original_observation,
+    )
     emit_recorded()
 
     if interrupted:

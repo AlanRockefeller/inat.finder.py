@@ -1632,6 +1632,151 @@ class TestOriginalMatchIsPreserved(MainRunnerMixin, unittest.TestCase):
         self.assertEqual(output.count("Observation #123456789"), 1)
 
 
+class TestNormalModeJsonReportsTheSuppliedObservation(
+    MainRunnerMixin, unittest.TestCase
+):
+    """A normal-mode result says what the number points at, and when it stopped."""
+
+    def _patches(self, original=None, batch=None):
+        return {
+            "verify_user_exists": Mock(return_value=True),
+            "fetch_observations": Mock(
+                return_value=[original or _observation(123456789)]
+            ),
+            "batch_check_observations": Mock(
+                side_effect=batch
+                or (lambda *a, **k: inat_finder.BatchCheckResult([], 0, 0))
+            ),
+            "resolve_observation_locations": Mock(
+                return_value={123456789: "Pike Co. MS US"}
+            ),
+        }
+
+    def test_declining_to_keep_searching_is_not_an_exhausted_search(self):
+        """The variations were never checked, so nothing may claim completeness."""
+        with patch("builtins.input", return_value="n"):
+            status, result, output = self.run_main_json(
+                ["inat_finder.py", "--user", "observer", "123456789", "--no-progress"],
+                self._patches(),
+            )
+        self.assertEqual(status, 0)
+        self.assertIn("Exiting search.", output)
+        self.assertEqual(result["status"], "match_found")
+        self.assertEqual(result["stop_reason"], "declined")
+        self.assertFalse(result["complete"])
+        self.assertEqual([match["id"] for match in result["matches"]], [123456789])
+        self.assertEqual(result["original"]["id"], 123456789)
+
+    def test_declining_a_large_search_is_not_an_exhausted_search(self):
+        # Three digits off a nine-digit number is far past the large-search
+        # threshold, so the second prompt is the one that stops the run.
+        with patch("builtins.input", side_effect=["y", "n"]) as prompt:
+            status, result, output = self.run_main_json(
+                [
+                    "inat_finder.py",
+                    "--user",
+                    "observer",
+                    "123456789",
+                    "--no-progress",
+                    "--digits",
+                    "3",
+                ],
+                self._patches(),
+            )
+        self.assertEqual(status, 0)
+        # Prompts are written by input(), not print(), so the call log is what
+        # says which of the two exits this run took.
+        self.assertIn("This is a large search", prompt.call_args_list[1].args[0])
+        self.assertIn("Exiting search.", output)
+        self.assertEqual(result["status"], "match_found")
+        self.assertEqual(result["stop_reason"], "declined")
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["original"]["id"], 123456789)
+
+    def test_declining_a_large_search_without_a_match_still_reports_the_number(self):
+        """Nothing matched, but nothing was searched either - say both."""
+        with patch("builtins.input", return_value="n"):
+            status, result, output = self.run_main_json(
+                [
+                    "inat_finder.py",
+                    "--user",
+                    "observer",
+                    "123456789",
+                    "--no-progress",
+                    "--digits",
+                    "3",
+                ],
+                self._patches(
+                    original=_observation(123456789, login="someone_else")
+                ),
+            )
+        self.assertEqual(status, 0)
+        self.assertIn("Search stopped at your request", output)
+        self.assertNotIn("Search complete!", output)
+        # The stock "why did this find nothing" advice would be a non sequitur.
+        self.assertNotIn("The observation may have more than one digit mistyped", output)
+        self.assertEqual(result["status"], "no_match")
+        self.assertEqual(result["stop_reason"], "declined")
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["original"]["id"], 123456789)
+
+    def test_continuing_to_the_end_still_reports_an_exhausted_search(self):
+        status, result, _ = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--user",
+                "observer",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            self._patches(),
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(result["status"], "match_found")
+        self.assertEqual(result["stop_reason"], "exhausted")
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["original"]["id"], 123456789)
+
+    def test_a_nonmatching_supplied_number_is_still_reported(self):
+        """It matched nothing, but the caller still needs to see what it is."""
+        status, result, output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--user",
+                "observer",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            self._patches(original=_observation(123456789, login="someone_else")),
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("exists but does not match", output)
+        self.assertEqual(result["status"], "no_match")
+        self.assertEqual(result["matches"], [])
+        self.assertEqual(result["original"]["id"], 123456789)
+        self.assertEqual(result["original"]["user"], "someone_else")
+        self.assertEqual(result["original"]["location"], "Pike Co. MS US")
+
+    def test_a_missing_supplied_number_reports_no_original(self):
+        patches = self._patches()
+        patches["fetch_observations"] = Mock(return_value=[])
+        status, result, _ = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--user",
+                "observer",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            patches,
+        )
+        self.assertEqual(status, 0)
+        self.assertIsNone(result["original"])
+
+
 class TestLookupFailuresAreNotNotFound(MainRunnerMixin, unittest.TestCase):
     """Issue 4: outages must never be reported as 'not found'."""
 
@@ -2810,9 +2955,45 @@ class TestAutoModeProjects(AutoModeMixin, unittest.TestCase):
         )
         self.assertEqual(status, 0)
         self.assertIn("Observation #123456788", output)
-        # One request per batch, every one of them carrying the project filter.
-        self.assertTrue(all(call["project_id"] == "42" for call in calls))
+        # One request per search batch, every one of them carrying the project
+        # filter. Stage 0 is deliberately unfiltered - it asks what the supplied
+        # number is, which a membership filter would refuse to answer.
         self.assertEqual(len(calls), 2)
+        self.assertIsNone(calls[0]["project_id"])
+        self.assertEqual(calls[0]["ids"], ["123456789"])
+        self.assertTrue(all(call["project_id"] == "42" for call in calls[1:]))
+
+    def test_supplied_number_outside_the_project_is_not_called_nonexistent(self):
+        """A non-member observation exists; only its membership is a 'no'."""
+        fetch, calls = self.fetcher({123456789}, project_members=set())
+        status, result, output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--project",
+                "fungi-map",
+                "123456789",
+                "--no-progress",
+                "--digits",
+                "1",
+                "--yes",
+            ],
+            {
+                "resolve_project_identifier": Mock(return_value=("42", PROJECT)),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertNotIn("does not exist", output)
+        self.assertIn("Observation #123456789 exists", output)
+        self.assertIn("matched 0 of 1 clue(s)", output)
+        # The supplied number is reported for what it points at, not dropped.
+        self.assertIsNotNone(result["original"])
+        self.assertEqual(result["original"]["id"], 123456789)
+        self.assertEqual(result["matches"], [])
+        # Stage 0: one unfiltered lookup, then one membership probe.
+        self.assertIsNone(calls[0]["project_id"])
+        self.assertEqual(calls[1], {"ids": ["123456789"], "project_id": "42"})
 
     def test_project_with_another_clue_probes_membership_separately(self):
         fetch, calls = self.fetcher({123456788}, project_members={123456788})
