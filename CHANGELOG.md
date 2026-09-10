@@ -2,7 +2,7 @@
 
 All notable changes to the inat.finder.py project will be documented in this file.
 
-## [1.8.0] - 2026-09-09
+## [1.8.0] - 2026-09-10
 
 ### Added
 
@@ -24,7 +24,7 @@ All notable changes to the inat.finder.py project will be documented in this fil
 - A resume token is now checked for a stage and offset that can actually exist, not only for a valid signature. An edited or stale cursor pointing past the end of the ladder is refused instead of searching nothing and reporting a clean "no match".
 - Ctrl+C keeps the matches already found in the stage that was running, rather than only those from stages that had finished.
 - A stage too large to search is reported as an error rather than as "no matches found", since that stage was never searched.
-- Under `--json`, a genus, family, taxon, user or project that does not exist in a normal (non-`--auto`) search now reports *why* in the result object, instead of leaving the explanation on stderr and handing the caller an error with no message.
+- Under `--json`, a genus, family, taxon, user or project that does not exist in a normal (non-`--auto`) search now reports _why_ in the result object, instead of leaving the explanation on stderr and handing the caller an error with no message.
 - A cancelled search reports the candidates its stage had really checked, rather than zero, so a progress display stays honest after Ctrl+C.
 
 ## [1.7.5] - 2026-09-01

@@ -2,13 +2,13 @@
 
 **Version:** 1.8.0
 **Author:** Alan Rockefeller
-**Release Date:** September 9, 2026
+**Release Date:** September 10, 2026
 
 ## Use it online - no installation required
 
 You can run this tool in your browser at **[dikarya.us/finder](https://dikarya.us/finder)** - no Python, no downloads, no setup.
 
-The instructions below are for those who prefer to run the command-line version locally.
+The instructions below are for those who prefer to run the command-line version locally or understand how it works.
 
 ## Overview
 
@@ -200,12 +200,12 @@ of the elements you supplied is the wrong one.
 
 ### The ladder
 
-| Stage | What it searches |
-| --- | --- |
-| 0 | the number exactly as supplied - it may be right, and something else wrong |
-| 1 | one substituted digit, plus adjacent swaps, plus the missing/extra-digit heuristics |
-| 2 | two substituted digits not already tried |
-| 3 | three substituted digits not already tried |
+| Stage | What it searches                                                                    |
+| ----- | ----------------------------------------------------------------------------------- |
+| 0     | the number exactly as supplied - it may be right, and something else wrong          |
+| 1     | one substituted digit, plus adjacent swaps, plus the missing/extra-digit heuristics |
+| 2     | two substituted digits not already tried                                            |
+| 3     | three substituted digits not already tried                                          |
 
 `--digits N` caps the ladder (default 3). No observation ID is ever requested twice
 across the whole ladder, and each stage prints how many new candidates it holds -
@@ -231,7 +231,7 @@ API calls, and carries on from exactly where the previous run stopped. The token
 bound to the observation number, the clues and the `--digits` cap, so a cursor can
 never be replayed against a search it did not come from.
 
-A search that stopped because *requests failed* gets no token. Its failed batches
+A search that stopped because _requests failed_ gets no token. Its failed batches
 are already marked as tried, so a cursor would skip them for good; that run exits
 `2` and should be retried from the beginning.
 
@@ -285,23 +285,23 @@ where a caller gets a bare exit status and nothing to show a user.
 
 `status` is one of:
 
-| Status | Exit | Meaning |
-| --- | --- | --- |
-| `match_found` | 0 | at least one observation matched at least one clue |
-| `no_match` | 0 | the search finished and nothing matched |
-| `needs_confirmation` | 0 | the next stage is large; ask the user, then re-run with `--yes` and the `resume` token |
-| `incomplete` | 2 | some candidates could not be checked; `resume` is always `null` |
-| `cancelled` | 130 | interrupted with Ctrl+C; whatever was found first is still reported |
-| `error` | 1 | the search could not run; `stop_reason` says why - see below |
-| `error` | 2 | a command-line syntax error; `stop_reason` is `usage` |
+| Status               | Exit | Meaning                                                                                |
+| -------------------- | ---- | -------------------------------------------------------------------------------------- |
+| `match_found`        | 0    | at least one observation matched at least one clue                                     |
+| `no_match`           | 0    | the search finished and nothing matched                                                |
+| `needs_confirmation` | 0    | the next stage is large; ask the user, then re-run with `--yes` and the `resume` token |
+| `incomplete`         | 2    | some candidates could not be checked; `resume` is always `null`                        |
+| `cancelled`          | 130  | interrupted with Ctrl+C; whatever was found first is still reported                    |
+| `error`              | 1    | the search could not run; `stop_reason` says why - see below                           |
+| `error`              | 2    | a command-line syntax error; `stop_reason` is `usage`                                  |
 
 An `error` exiting 1 carries one of three reasons:
 
-| `stop_reason` | Meaning |
-| --- | --- |
-| `bad_input` | a value the tool rejected - a malformed `--taxon-id`, a non-numeric observation number, or, without `--auto`, a genus, family, taxon, user or project that does not exist |
-| `bad_resume` | the resume token is malformed, belongs to a different search, or points outside the ladder |
-| `too_large` | a stage would need more candidates than the tool will ever check; lower `--digits` |
+| `stop_reason` | Meaning                                                                                                                                                                   |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bad_input`   | a value the tool rejected - a malformed `--taxon-id`, a non-numeric observation number, or, without `--auto`, a genus, family, taxon, user or project that does not exist |
+| `bad_resume`  | the resume token is malformed, belongs to a different search, or points outside the ladder                                                                                |
+| `too_large`   | a stage would need more candidates than the tool will ever check; lower `--digits`                                                                                        |
 
 `exit_code` repeats the process's exit status, so a caller that only has stdout
 never has to infer it. Note that `error` covers both statuses above: `stop_reason`
@@ -323,8 +323,8 @@ project membership, when that request failed while the observation itself came b
 ### Calling it from a web front end
 
 `needs_confirmation` is the hook for a "keep searching" button: the object carries
-`estimated_candidates` and `estimated_seconds`, so the page can ask *"Deep search:
-about 59,000 more possibilities. Continue?"* and re-run with `--yes` and the resume
+`estimated_candidates` and `estimated_seconds`, so the page can ask _"Deep search:
+about 59,000 more possibilities. Continue?"_ and re-run with `--yes` and the resume
 token when the user says yes. Auto mode never prompts when stdin is not a terminal,
 so it cannot block waiting for an answer that will not come.
 
@@ -341,7 +341,7 @@ subprocess.run(
 ```
 
 **Merge resumed results, do not replace them.** A resumed run reports only what
-*it* found; the token carries a position, not the earlier run's matches. Keep the
+_it_ found; the token carries a position, not the earlier run's matches. Keep the
 matches you already have and merge the new ones by observation `id`, taking the
 higher `score` when the same observation appears twice.
 
