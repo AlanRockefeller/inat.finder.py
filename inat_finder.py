@@ -2,7 +2,7 @@
 """
 iNaturalist Observation Finder
 
-Version 1.7.5 - By Alan Rockefeller - August 30, 2026
+Version 1.8.0 - By Alan Rockefeller - September 9, 2026
 
 This script helps find the correct iNaturalist observation number when there are mistyped digits.
 It works by systematically changing digits of the provided observation number and checking if
@@ -18,8 +18,17 @@ Mushroom Observer observation number instead.
 
 The script can also parse observation numbers directly from iNaturalist URLs.
 
+Auto mode (--auto) turns the tool into one command for a foray: supply whichever
+clues you happen to have - genus, family, taxon ID, collector, project, any
+combination, or none - and it climbs a ladder of progressively wider typo
+hypotheses, stopping the moment it finds an observation that matches every clue.
+A clue that turns out to be wrong is reported and dropped rather than ending the
+search, because on a foray the mistaken element is as often the genus as the
+number.
+
 Usage:
     python inat_finder.py (--genus NAME | --family NAME | --taxon-id ID | --user USER | --project PROJECT) OBSERVATION [options]
+    python inat_finder.py --auto [--genus NAME] [--user USER] [...] OBSERVATION [options]
 
 Arguments:
     --genus <genus>         The genus name to match (e.g., "Galerina")
@@ -34,7 +43,14 @@ Arguments:
                                or a complete iNaturalist URL
 
 Options:
-    --digits N          Number of digits that might be wrong (default: 1)
+    --auto              Try the common failure modes in order, widening the search
+                        until something matches. Accepts any combination of clues.
+    --digits N          Number of digits that might be wrong (default: 1, or 3 with
+                        --auto, where it caps how wide the ladder may go)
+    --auto-resume TOKEN Continue an --auto search from where a previous run stopped,
+                        using the token that run printed
+    --json              Print one machine-readable JSON result on stdout and send
+                        all human narration to stderr
     --verbose           Print detailed information about each attempt
     --no-progress       Hide the progress bar (progress bar is shown by default)
     --yes, -y           Assume "yes" at every confirmation prompt (never reads stdin)
@@ -52,7 +68,11 @@ Exit status:
 """
 
 import argparse
+import contextlib
+import enum
+import hashlib
 import itertools
+import json
 import re
 import sys
 import textwrap
@@ -65,7 +85,7 @@ from email.utils import parsedate_to_datetime
 import requests
 from tqdm import tqdm
 
-VERSION = "1.7.5"
+VERSION = "1.8.0"
 API_BASE_URL = "https://api.inaturalist.org/v1"
 BATCH_SIZE = 200
 REQUEST_TIMEOUT = 20
@@ -87,6 +107,15 @@ MAX_SEARCH_CANDIDATES = 1_000_000
 # substantially more memory than the streamed CLI search. Keep its ceiling lower.
 MAX_EAGER_CANDIDATES = 100_000
 OBSERVATION_FIELDS = "id,taxon,user,place_ids,place_guess"
+# How wide --auto is allowed to climb when --digits is not given explicitly.
+AUTO_DEFAULT_MAX_DIGITS = 3
+# Bumped whenever candidate generation changes order or content. A resume cursor
+# from an older generation would point at the wrong place, so it is part of the
+# resume fingerprint and an old token is rejected rather than silently misused.
+CANDIDATE_GENERATION_VERSION = 1
+RESUME_TOKEN_VERSION = 1
+# Schema version of the --json result object.
+JSON_RESULT_VERSION = 1
 PLACE_FIELDS = "id,name,admin_level,display_name"
 # Exit status used when the API could not be reached, so a failed lookup or an
 # incomplete search is never mistaken for a clean "nothing found" result.
@@ -121,6 +150,130 @@ class TaxonAmbiguityError(ValueError):
         super().__init__(
             f"{len(self.candidates)} distinct taxa match {rank} '{taxon_name}'"
         )
+
+
+class UsageError(SystemExit):
+    """A command-line syntax error: exits 2, and carries its message for --json.
+
+    Argparse normally writes its message to stderr and exits, which leaves a
+    --json caller with a non-zero status and no JSON at all. Raising instead lets
+    the JSON writer report the same message it printed, without changing either
+    the stderr output or the documented exit status.
+    """
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(2)
+
+
+class SearchInterrupted(KeyboardInterrupt):
+    """Ctrl+C during a batched search, carrying what the search had already done.
+
+    A KeyboardInterrupt subclass on purpose: every existing ``except
+    KeyboardInterrupt`` keeps working unchanged, while a caller that wants the
+    partial counts - how many candidates were really checked before the key was
+    pressed - can read them off ``result`` instead of inventing zeroes.
+    """
+
+    def __init__(self, result):
+        self.result = result
+        super().__init__()
+
+
+class InputError(SystemExit):
+    """Input the script itself rejects: exits 1, and carries why for --json.
+
+    Distinct from :class:`UsageError`, which is argparse's own status 2. Both keep
+    printing what they always printed; raising rather than exiting is only so the
+    JSON writer can report the same explanation.
+    """
+
+    def __init__(self, message):
+        self.message = message
+        super().__init__(1)
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """An ArgumentParser whose errors can be caught rather than only exiting."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write(f"{self.prog}: error: {message}\n")
+        raise UsageError(f"{self.prog}: error: {message}")
+
+
+def wants_json(argv):
+    """True when argv asks for --json, before argparse has had a chance to say so.
+
+    The JSON contract has to cover command lines argparse itself rejects, so the
+    flag must be detected by scanning. Argparse accepts unambiguous abbreviations
+    and no other option begins with "j", so any "--j" prefix counts. A bare "--"
+    ends option parsing, so scanning stops there.
+    """
+    for token in argv[1:]:
+        if token == "--":
+            break
+        if len(token) > 2 and "--json".startswith(token):
+            return True
+    return False
+
+
+class Evidence(enum.Enum):
+    """What one clue has to say about one observation.
+
+    ``UNKNOWN`` is the important member: project membership is answered by a
+    separate request, and when that request fails the genus, user and taxon
+    evidence for the same observation is still perfectly good. Saying "unknown"
+    keeps that evidence instead of throwing the whole batch away, and it never
+    counts toward a score, so an unconfirmed clue can never end the search early.
+    """
+
+    MATCH = "match"
+    NO_MATCH = "no_match"
+    UNKNOWN = "unknown"
+
+
+# Evidence about a whole batch that cannot be read off an individual observation.
+# ``project_member_ids`` is the set of observation IDs in the batch that belong to
+# the requested project, or None when that could not be determined.
+BatchContext = namedtuple("BatchContext", ["project_member_ids"])
+BatchContext.__new__.__defaults__ = (None,)
+
+# A clue the user supplied that iNaturalist could not resolve. In --auto mode the
+# search continues without it; ``ambiguity`` carries a TaxonAmbiguityError when the
+# name matched more than one taxon, so the caller can print the --taxon-id list.
+UnusableClue = namedtuple("UnusableClue", ["kind", "value", "reason", "ambiguity"])
+UnusableClue.__new__.__defaults__ = (None,)
+
+# One observation that matched at least one clue, with the clues it matched, the
+# clues that could not be checked, and the ladder stage that found it.
+ScoredMatch = namedtuple("ScoredMatch", ["observation", "matched", "unknown", "stage"])
+
+
+class Criterion:
+    """One clue the user supplied, and how to test an observation against it.
+
+    Criteria are evaluated against a batch context rather than an observation
+    alone, because project membership is decided server-side and arrives with the
+    batch, not with the observation record.
+    """
+
+    def __init__(self, kind, value, label, evaluator):
+        self.kind = kind
+        self.value = value
+        self.label = label
+        self._evaluator = evaluator
+        # Set for taxonomic clues, so the single-criterion path can still report
+        # the verified taxon it matched through.
+        self.taxon_id = None
+        self.taxon = None
+
+    def evaluate(self, observation, context):
+        """Return the :class:`Evidence` this clue gives about ``observation``."""
+        return self._evaluator(observation, context)
+
+    def __repr__(self):  # pragma: no cover - debugging aid
+        return f"Criterion({self.kind!r}, {self.value!r})"
 
 
 class RateLimiter:
@@ -279,6 +432,16 @@ def parse_taxon_id_argument(value):
     return number if number > 0 else None
 
 
+def _argv_position(flag, argv=None):
+    """Where ``flag`` first appears in argv, or a large number when it does not."""
+    if argv is None:
+        argv = sys.argv
+    for index, token in enumerate(argv):
+        if token == flag or token.startswith(flag + "="):
+            return index
+    return len(argv) + 1
+
+
 def parse_arguments():
     """
     Parses command-line arguments for the iNaturalist observation finder.
@@ -290,18 +453,25 @@ def parse_arguments():
     disable the progress bar, and assume "yes" at every confirmation prompt. If no
     arguments are provided, the help message is printed and the program exits.
 
+    The search criteria are mutually exclusive and one is required - unless --auto
+    is given, where any combination, including none, is accepted. Argparse cannot
+    express "required unless", so the rule is enforced by hand through
+    ``parser.error`` in order to keep the documented exit status: a command-line
+    syntax error exits 2 with a usage message on stderr, exactly as before.
+
     Returns:
         argparse.Namespace: An object with attributes corresponding to the parsed arguments.
     """
     # Create a formatted description from the module docstring
     description = textwrap.dedent(__doc__)
 
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         description=description,
         formatter_class=argparse.RawDescriptionHelpFormatter,  # Use this to preserve formatting
     )
-    search_group = parser.add_argument_group("search criteria (one required)")
-    group = search_group.add_mutually_exclusive_group(required=True)
+    group = parser.add_argument_group(
+        "search criteria (one required, or any combination with --auto)"
+    )
     group.add_argument("--genus", help="The genus name to match (e.g., 'Amanita')")
     group.add_argument(
         "--family", help="The family name to match (e.g., 'Amanitaceae')"
@@ -326,10 +496,40 @@ def parse_arguments():
         help="The potentially mistyped iNaturalist observation number or URL",
     )
     parser.add_argument(
+        "--auto",
+        action="store_true",
+        help=(
+            "Try the common failure modes in order, widening the search until "
+            "something matches. Accepts any combination of search criteria, "
+            "including none, and keeps going when one of them turns out to be wrong"
+        ),
+    )
+    parser.add_argument(
+        "--auto-resume",
+        dest="auto_resume",
+        metavar="TOKEN",
+        help=(
+            "Continue an --auto search from where a previous run stopped, using "
+            "the token that run printed"
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "Print one machine-readable JSON result on stdout, with all human "
+            "narration on stderr"
+        ),
+    )
+    parser.add_argument(
         "--digits",
         type=int,
-        default=1,
-        help="Maximum number of digits that might be wrong (default: 1)",
+        default=None,
+        help=(
+            "Maximum number of digits that might be wrong (default: 1; with "
+            f"--auto it caps how wide the ladder may go, default "
+            f"{AUTO_DEFAULT_MAX_DIGITS})"
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -354,6 +554,34 @@ def parse_arguments():
         sys.exit(1)
 
     args = parser.parse_args()
+
+    supplied = [
+        "--" + name.replace("_", "-")
+        for name in ("genus", "family", "taxon_id", "user", "project")
+        if getattr(args, name)
+    ]
+    # Report conflicts in the order the flags were typed, the way argparse's own
+    # mutually exclusive group did before --auto made the group conditional.
+    supplied.sort(key=lambda flag: _argv_position(flag))
+    if not args.auto:
+        if not supplied:
+            parser.error(
+                "one of the arguments --genus --family --taxon-id --user --project "
+                "is required (or use --auto to search with any combination of "
+                "them, including none)"
+            )
+        if len(supplied) > 1:
+            parser.error(
+                f"argument {supplied[-1]}: not allowed with argument "
+                f"{supplied[0]} (use --auto to search with both)"
+            )
+    if args.auto_resume and not args.auto:
+        parser.error("argument --auto-resume: only meaningful with --auto")
+
+    # --digits means "how many digits might be wrong" in a normal search and "how
+    # wide may the ladder go" in an auto one, so its default depends on the mode.
+    if args.digits is None:
+        args.digits = AUTO_DEFAULT_MAX_DIGITS if args.auto else 1
 
     return args
 
@@ -644,6 +872,171 @@ class CandidatePlan:
         return lines
 
 
+_STAGE_ORDINALS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five"}
+
+
+def auto_stage_label(index, plan):
+    """Describe a ladder stage in terms of what it really searches.
+
+    Deliberately derived from the plan rather than hard-coded, because
+    :class:`CandidatePlan` does not add one edit class per ``digits_off``: it
+    always tries up to two inserted and two removed digits when those classes are
+    enabled at all, and it contributes adjacent swaps only below two substituted
+    digits. Describing stage 1 as "one digit off" would be a plain lie about what
+    the tool checked.
+    """
+    if index <= 0:
+        return "the number exactly as supplied"
+
+    ordinal = _STAGE_ORDINALS.get(index, str(index))
+    digit_word = "digit" if index == 1 else "digits"
+    parts = [f"{ordinal} substituted {digit_word}"]
+    if plan.transpositions:
+        parts.append("adjacent swaps")
+    if plan.additions and plan.removals:
+        parts.append("missing or extra digits")
+    elif plan.additions:
+        parts.append("missing digits")
+    elif plan.removals:
+        parts.append("extra digits")
+
+    if len(parts) == 1:
+        return parts[0]
+    if len(parts) == 2:
+        return f"{parts[0]} and {parts[1]}"
+    return ", ".join(parts[:-1]) + f", and {parts[-1]}"
+
+
+class AutoStage:
+    """One rung of the --auto ladder: a plan minus every candidate already tried.
+
+    The ladder works because the plans nest -
+    ``CandidatePlan(n, 1) < CandidatePlan(n, 2) < CandidatePlan(n, 3)`` as sets -
+    so stage ``k`` is just plan ``k`` with everything an earlier stage already
+    yielded filtered out. Insertions and removals are identical across plans, and
+    stage 1's transpositions are all two-digit substitutions, so nothing is lost.
+
+    The size is ``plan.total - len(seen_ids)``, measured when the stage starts.
+    That, and not ``plan_k.total - plan_(k-1).total``, is the correct total: a
+    stage can end before its candidates run out - a permanent run of failed
+    batches stops it, and so does finding a full match - which leaves candidates
+    that were never yielded and so never entered ``seen_ids``. The next stage
+    picks them up, and only this form declares a total that matches what will
+    really be attempted. The progress bar and the unchecked accounting both
+    depend on that total being right.
+
+    ``plan_position`` counts entries pulled from the *plan*, not candidates
+    yielded, because that is what a resume cursor has to replay.
+    """
+
+    def __init__(self, index, plan, seen_ids):
+        self.index = index
+        self.plan = plan
+        self.seen_ids = seen_ids
+        self.label = auto_stage_label(index, plan)
+        self.total = max(0, plan.total - len(seen_ids))
+        self.plan_position = 0
+
+    def __len__(self):
+        return self.total
+
+    def __iter__(self):
+        for position, candidate in enumerate(self.plan, start=1):
+            self.plan_position = position
+            value = int(candidate)
+            if value in self.seen_ids:
+                continue
+            self.seen_ids.add(value)
+            yield candidate
+
+    def exhausted(self):
+        """True when every entry of the underlying plan has been pulled."""
+        return self.plan_position >= self.plan.total
+
+
+def build_candidate_plan(number_str, digits_off):
+    """Build the plan for one ladder stage, using the caller-independent rules.
+
+    Insertions only make sense below nine digits and removals only above five, so
+    those switches come from the number, never from ``digits_off``.
+    """
+    add_digits = digits_off > 0 and len(number_str) < 9
+    remove_digits = digits_off > 0 and len(number_str) > 5
+    return CandidatePlan(
+        number_str, digits_off, add_digits=add_digits, remove_digits=remove_digits
+    )
+
+
+def search_fingerprint(number_str, criteria, digits_cap):
+    """Return a short hash binding a resume cursor to the search that made it.
+
+    A bare "stage 2, offset 400" cursor is meaningless - worse, silently wrong -
+    if it is replayed against a different observation number, a different set of
+    clues, or a build whose candidate order has changed. The fingerprint is not a
+    secret and does not need to be; it exists so an accidental mismatch is an
+    error instead of a search that quietly skips the wrong candidates.
+    """
+    parts = [
+        str(CANDIDATE_GENERATION_VERSION),
+        number_str,
+        str(digits_cap),
+    ]
+    parts.extend(sorted(f"{item.kind}={item.value}" for item in criteria))
+    digest = hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+    return digest[:8]
+
+
+def build_resume_token(stage, offset, fingerprint):
+    """Format a resume cursor as ``v1:<stage>:<offset>:<fingerprint>``."""
+    return f"v{RESUME_TOKEN_VERSION}:{stage}:{offset}:{fingerprint}"
+
+
+def parse_resume_token(token):
+    """Return ``(stage, offset, fingerprint)`` from a resume token.
+
+    Raises:
+        ValueError: The token is not a resume cursor this version understands.
+    """
+    try:
+        parts = token.strip().split(":")
+    except AttributeError as error:
+        raise ValueError(
+            f"resume token must be text, not {type(token).__name__}"
+        ) from error
+    if len(parts) != 4:
+        raise ValueError(f"'{token}' is not a resume token")
+    version, stage, offset, fingerprint = parts
+    if not version.startswith("v") or not version[1:].isdigit():
+        raise ValueError(f"'{token}' is not a resume token")
+    if int(version[1:]) != RESUME_TOKEN_VERSION:
+        raise ValueError(
+            f"resume token version {version[1:]} is not supported by this release"
+        )
+    if not stage.isdigit() or not offset.isdigit() or not fingerprint:
+        raise ValueError(f"'{token}' is not a resume token")
+    return int(stage), int(offset), fingerprint
+
+
+def restore_seen_ids(number_str, stage_index, offset):
+    """Rebuild the already-tried set a resume cursor implies. No API calls.
+
+    Replaying is exact rather than approximate: candidate generation is
+    deterministic, so iterating the earlier plans in full and the first ``offset``
+    entries of the cursor's own plan reproduces precisely the IDs the original run
+    had already put in ``seen_ids``.
+    """
+    seen = set()
+    for index in range(1, stage_index):
+        for candidate in build_candidate_plan(number_str, index):
+            seen.add(int(candidate))
+    if offset > 0 and stage_index > 0:
+        for position, candidate in enumerate(build_candidate_plan(number_str, stage_index)):
+            if position >= offset:
+                break
+            seen.add(int(candidate))
+    return seen
+
+
 def verify_user_exists(username):
     """
     Verify if a username exists on iNaturalist.
@@ -819,21 +1212,48 @@ def search_projects_by_query(query):
     return data.get("results") or []
 
 
-def resolve_project_identifier(project_input):
+def resolve_project_identifier(project_input, strict=True, message_callback=None):
     """
     Resolves a project input string to a valid project ID/slug and metadata.
 
     Args:
         project_input: The input string (ID, slug, URL, or title).
+        strict: When True (the default, and what every non-auto search uses) an
+            ambiguous or missing project ends the program with status 1. --auto
+            passes False, because there a project that cannot be resolved is a
+            clue that turned out to be wrong rather than a fatal input error: the
+            same explanation is printed, ``(None, None)`` comes back, and the
+            remaining clues carry the search.
+        message_callback: Where the explanation is written.
 
     Returns:
-        tuple: (project_id_or_slug, project_metadata_dict)
+        tuple: (project_id_or_slug, project_metadata_dict), or (None, None) when
+        the project could not be resolved and ``strict`` is False.
 
     Raises:
-        ApiError: The project could not be looked up (network/API failure).
+        ApiError: The project could not be looked up (network/API failure). This
+            is never downgraded to "unresolvable", in either mode.
 
-    Exits the program if the project is ambiguous or definitely does not exist.
+    Exits the program if the project is ambiguous or definitely does not exist,
+    unless ``strict`` is False.
     """
+
+    # Resolved here rather than as a default so that a caller (or a test) which
+    # replaces the built-in print still sees these explanations.
+    if message_callback is None:
+        message_callback = print
+
+    def give_up(detail):
+        """Fail in strict mode; hand an unresolved project back in auto mode.
+
+        The explanation has already been printed; ``detail`` carries it into the
+        exception so that --json reports the same reason rather than a bare
+        status with the useful part left on stderr.
+        """
+        if strict:
+            raise InputError(detail)
+        return None, None
+
     slug_from_url = parse_project_slug_from_url(project_input)
     direct_identifier = project_input if project_input.isdigit() else slug_from_url
     if direct_identifier is None and " " not in project_input:
@@ -851,11 +1271,15 @@ def resolve_project_identifier(project_input):
             return str(project.get("id", direct_identifier)), project
 
         if project_input.isdigit():
-            print(f"Error: Project ID '{project_input}' not found on iNaturalist.")
-            sys.exit(1)
+            message_callback(
+                f"Error: Project ID '{project_input}' not found on iNaturalist."
+            )
+            return give_up(
+                f"Project ID '{project_input}' not found on iNaturalist."
+            )
         if slug_from_url:
-            print(f"Error: Project URL slug '{slug_from_url}' not found.")
-            sys.exit(1)
+            message_callback(f"Error: Project URL slug '{slug_from_url}' not found.")
+            return give_up(f"Project URL slug '{slug_from_url}' not found.")
 
     # 3. Determine if it's likely a title or a slug
     # Conservative slug detection:
@@ -869,8 +1293,8 @@ def resolve_project_identifier(project_input):
     candidates = search_projects_by_query(project_input)
 
     if not candidates:
-        print(f"Error: Project '{project_input}' not found on iNaturalist.")
-        sys.exit(1)
+        message_callback(f"Error: Project '{project_input}' not found on iNaturalist.")
+        return give_up(f"Project '{project_input}' not found on iNaturalist.")
 
     # Try to find exact match
     project_input_lower = project_input.lower()
@@ -889,18 +1313,30 @@ def resolve_project_identifier(project_input):
 
     if len(exact_matches) > 1:
         # This shouldn't happen often for slugs, maybe for titles
-        print(f"Found multiple exact matches for '{project_input}':")
+        message_callback(f"Found multiple exact matches for '{project_input}':")
         for p in exact_matches:
-            print(f" - {p.get('title')} (ID: {p.get('id')}, Slug: {p.get('slug')})")
-        print("Please use the specific ID or Slug.")
-        sys.exit(1)
+            message_callback(
+                f" - {p.get('title')} (ID: {p.get('id')}, Slug: {p.get('slug')})"
+            )
+        message_callback("Please use the specific ID or Slug.")
+        return give_up(
+            f"'{project_input}' matches more than one project exactly; "
+            "use the specific ID or slug."
+        )
 
     # If no exact match, but we have candidates, show disambiguation
-    print(f"No exact match found for '{project_input}', but found similar projects:")
+    message_callback(
+        f"No exact match found for '{project_input}', but found similar projects:"
+    )
     for p in candidates[:5]:
-        print(f" - {p.get('title')} (ID: {p.get('id')}, Slug: {p.get('slug')})")
-    print("\nPlease re-run with the specific Project ID or Slug.")
-    sys.exit(1)
+        message_callback(
+            f" - {p.get('title')} (ID: {p.get('id')}, Slug: {p.get('slug')})"
+        )
+    message_callback("\nPlease re-run with the specific Project ID or Slug.")
+    return give_up(
+        f"No project exactly matches '{project_input}'; re-run with the "
+        "specific project ID or slug."
+    )
 
 
 def preprocess_argv_for_project_name(argv, warn=print):
@@ -1010,8 +1446,23 @@ def parse_inat_url(url_or_number):
 
 
 BatchCheckResult = namedtuple(
-    "BatchCheckResult", ["observations", "unchecked", "failed_batches"]
+    "BatchCheckResult",
+    [
+        "observations",
+        "unchecked",
+        "failed_batches",
+        # Candidates pulled from the iterator, which is what a resume cursor needs.
+        "consumed",
+        # True when the caller asked to stop before the candidates ran out. The
+        # candidates left behind are NOT unchecked: nothing failed, they were
+        # deliberately skipped, so they must not push the exit status to 2.
+        "stopped_early",
+        # Batches whose observations were fetched but whose project membership
+        # could not be, leaving that one clue unknown for those observations.
+        "membership_unknown",
+    ],
 )
+BatchCheckResult.__new__.__defaults__ = (0, False, 0)
 
 
 def _iter_batches(candidates, batch_size):
@@ -1024,6 +1475,28 @@ def _iter_batches(candidates, batch_size):
             batch = []
     if batch:
         yield batch
+
+
+def fetch_project_membership(ids, project_id, batch_size=BATCH_SIZE):
+    """Return the subset of ``ids`` that belongs to ``project_id``.
+
+    Project membership has to be answered by iNaturalist rather than read off the
+    observation record: a collection project's membership is rule-based and does
+    not appear in an observation's own ``project_ids``. This is the second request
+    a batch needs when --project is combined with other clues, since the plain
+    request must not be filtered down to project members only.
+
+    Raises:
+        ApiError: The membership request could not be completed.
+    """
+    observations = fetch_observations(
+        ids, project_id=project_id, batch_size=batch_size
+    )
+    return {
+        str(observation.get("id"))
+        for observation in observations
+        if isinstance(observation, dict) and observation.get("id") is not None
+    }
 
 
 def fetch_observations(ids, project_id=None, batch_size=BATCH_SIZE):
@@ -1054,6 +1527,9 @@ def batch_check_observations(
     total=None,
     retry_rounds=BATCH_RETRY_ROUNDS,
     collect_results=True,
+    context_callback=None,
+    stop_callback=None,
+    membership_project_id=None,
 ):
     """
     Check observation IDs by querying the iNaturalist API in batches.
@@ -1074,6 +1550,20 @@ def batch_check_observations(
         results_callback: Optional callable receiving each batch's observations as soon
             as they arrive, so callers can report matches while the search runs.
         message_callback: Callable used for request error messages.
+        context_callback: Optional callable receiving the :class:`BatchContext` for
+            a batch immediately *before* ``results_callback`` is given that batch's
+            observations. It carries the evidence that belongs to the batch rather
+            than to any one observation, which today means project membership.
+        stop_callback: Optional callable invoked after each successfully checked
+            batch. Returning True ends the search without requesting another batch.
+            Candidates never pulled are reported through ``consumed``, not through
+            ``unchecked`` - nothing failed, so the result is still complete.
+        membership_project_id: When set, each batch gets a second request to work
+            out which of its observations belong to that project. Used when
+            --project is one clue among several and the main request therefore
+            must not be filtered by it. A failed probe leaves membership unknown
+            for that batch and is counted in ``membership_unknown``; it does not
+            discard the genus, user or taxon evidence the batch did return.
         total: Known total number of candidates, for progress reporting and exact
             counting of candidates skipped by outage fail-fast. Sized iterables
             are counted automatically when this is omitted.
@@ -1098,10 +1588,13 @@ def batch_check_observations(
     unchecked = 0
     failed_count = 0
     consecutive_failures = 0
+    membership_unknown = 0
+    stopped_early = False
     start = 0
 
     def run_batch(batch, batch_start):
         """Return True when the batch was checked; False when its request failed."""
+        nonlocal membership_unknown
         if batch_callback:
             batch_callback(batch, batch_start, total)
         try:
@@ -1115,45 +1608,109 @@ def batch_check_observations(
             )
             return False
 
+        context = BatchContext()
+        if project_id:
+            # The request was already filtered server-side, so everything it
+            # returned is a member and nothing else in the batch is.
+            context = BatchContext(
+                project_member_ids={
+                    str(observation.get("id"))
+                    for observation in batch_results
+                    if isinstance(observation, dict)
+                    and observation.get("id") is not None
+                }
+            )
+        elif membership_project_id and batch_results:
+            try:
+                context = BatchContext(
+                    project_member_ids=fetch_project_membership(
+                        batch, membership_project_id, batch_size=batch_size
+                    )
+                )
+            except ApiError as error:
+                # The observations themselves came back fine. Keep that evidence
+                # and mark only the project clue unknown for this batch.
+                membership_unknown += 1
+                message_callback(
+                    f"Error checking project membership: {error} "
+                    f"(project membership unknown for {len(batch_results)} "
+                    "observation(s) in this batch)"
+                )
+
         if collect_results:
             all_results.extend(batch_results)
+        if context_callback:
+            context_callback(context)
         if results_callback:
             results_callback(batch_results)
         if progress_callback:
             progress_callback(len(batch), True)
         return True
 
-    for batch in _iter_batches(variations, batch_size):
-        checked = run_batch(batch, start)
-        for round_number in range(retry_rounds):
-            if checked:
-                break
-            message_callback(f"Retrying failed batch (attempt {round_number + 2})...")
+    def collected():
+        """The result as it stands right now."""
+        return BatchCheckResult(
+            all_results,
+            unchecked,
+            failed_count,
+            start,
+            stopped_early,
+            membership_unknown,
+        )
+
+    try:
+        for batch in _iter_batches(variations, batch_size):
             checked = run_batch(batch, start)
+            for round_number in range(retry_rounds):
+                if checked:
+                    break
+                message_callback(
+                    f"Retrying failed batch (attempt {round_number + 2})..."
+                )
+                checked = run_batch(batch, start)
 
-        start += len(batch)
-        if checked:
-            consecutive_failures = 0
-            continue
+            start += len(batch)
+            if checked:
+                consecutive_failures = 0
+                if stop_callback and stop_callback():
+                    stopped_early = True
+                    break
+                continue
 
-        unchecked += len(batch)
-        failed_count += 1
-        consecutive_failures += 1
+            unchecked += len(batch)
+            failed_count += 1
+            consecutive_failures += 1
 
-        if total is not None and consecutive_failures >= MAX_CONSECUTIVE_FAILED_BATCHES:
-            skipped = max(0, total - start)
-            unchecked += skipped
-            message_callback(
-                f"Stopping after {consecutive_failures} consecutive batches "
-                f"failed permanently; {skipped} planned candidate(s) will remain "
-                "unchecked."
-            )
-            break
+            if (
+                total is not None
+                and consecutive_failures >= MAX_CONSECUTIVE_FAILED_BATCHES
+            ):
+                skipped = max(0, total - start)
+                unchecked += skipped
+                message_callback(
+                    f"Stopping after {consecutive_failures} consecutive batches "
+                    f"failed permanently; {skipped} planned candidate(s) will "
+                    "remain unchecked."
+                )
+                break
+    except KeyboardInterrupt as error:
+        # Hand the caller what was actually done, so a cancelled search can still
+        # say "searched 600 of 2,836" instead of reporting nothing.
+        if unchecked and progress_callback:
+            progress_callback(unchecked, False)
+        raise SearchInterrupted(collected()) from error
 
     if unchecked and progress_callback:
         progress_callback(unchecked, False)
 
-    return BatchCheckResult(all_results, unchecked, failed_count)
+    return BatchCheckResult(
+        all_results,
+        unchecked,
+        failed_count,
+        start,
+        stopped_early,
+        membership_unknown,
+    )
 
 
 def fetch_places(place_ids, batch_size=BATCH_SIZE, message_callback=print):
@@ -1379,6 +1936,245 @@ def check_observation_user(observation, target_username):
     return False
 
 
+def _taxon_criterion(kind, value, label, taxon_id, name=None, rank=None, taxon=None):
+    """Build a clue that matches through the observation's taxonomic ancestry."""
+
+    def evaluate(observation, context):
+        del context  # taxonomy is decidable from the observation alone
+        if check_observation_taxon(observation, name, rank, taxon_id):
+            return Evidence.MATCH
+        return Evidence.NO_MATCH
+
+    criterion = Criterion(kind, value, label, evaluate)
+    criterion.taxon_id = taxon_id
+    criterion.taxon = taxon
+    return criterion
+
+
+def _user_criterion(username):
+    """Build a clue that matches the observation's creator."""
+
+    def evaluate(observation, context):
+        del context
+        if check_observation_user(observation, username):
+            return Evidence.MATCH
+        return Evidence.NO_MATCH
+
+    return Criterion("user", username, f"user '{username}'", evaluate)
+
+
+def _project_criterion(value, label):
+    """Build a clue answered by the batch, not by the observation.
+
+    Whether an observation is in a project is something only iNaturalist can say -
+    a collection project's membership is rule-based - so this reads the answer out
+    of the batch context. When that answer is missing the verdict is UNKNOWN, not
+    NO_MATCH: an unanswered question must never look like a negative one.
+    """
+
+    def evaluate(observation, context):
+        members = context.project_member_ids
+        if members is None:
+            return Evidence.UNKNOWN
+        if str(observation.get("id")) in members:
+            return Evidence.MATCH
+        return Evidence.NO_MATCH
+
+    return Criterion("project", value, label, evaluate)
+
+
+ResolvedCriteria = namedtuple(
+    "ResolvedCriteria",
+    [
+        "criteria",
+        "unusable",
+        # Server-side project filter, set only when the project is the only clue.
+        "project_id_param",
+        # Per-batch membership probe target, set when the project shares the
+        # search with other clues and so must not filter the main request.
+        "membership_project_id",
+        "project_metadata",
+    ],
+)
+
+
+def resolve_criteria(args, strict=True, message_callback=None):
+    """Verify every clue the user supplied, in one place for both search modes.
+
+    ``strict`` is the whole difference between the two modes. A normal search has
+    exactly one criterion and an unresolvable one is a fatal input error, exactly
+    as before. An --auto search may have several, and one that cannot be resolved
+    is reported, dropped, and left out of scoring while the rest carry on - the
+    point of auto mode being that the wrong element is as often the genus as the
+    number.
+
+    What ``strict`` does *not* change: malformed input is always fatal, and an
+    :class:`ApiError` is always an outage rather than an unresolvable clue. A clue
+    must never be silently discarded because iNaturalist was unreachable.
+
+    Raises:
+        ApiError: A lookup could not be completed.
+        SystemExit: Malformed input, in either mode.
+    """
+    if message_callback is None:
+        message_callback = print
+
+    criteria = []
+    unusable = []
+    project_id_param = None
+    membership_project_id = None
+    project_metadata = None
+
+    def reject(kind, value, reason, ambiguity=None):
+        """Record a clue that iNaturalist could not resolve."""
+        unusable.append(UnusableClue(kind, value, reason, ambiguity))
+        if not strict:
+            message_callback(f"  Ignoring the {kind} clue and continuing.")
+
+    for kind, rank in (("genus", "genus"), ("family", "family")):
+        name = getattr(args, kind)
+        if not name:
+            continue
+        message_callback(f"Verifying {kind} '{name}' exists on iNaturalist...")
+        try:
+            taxon = find_taxon(name, rank)
+        except TaxonAmbiguityError as error:
+            message_callback(
+                f"Error: {kind.title()} '{name}' is ambiguous in "
+                "the iNaturalist taxonomy."
+            )
+            message_callback("Exact matches:")
+            for candidate in error.candidates:
+                message_callback("  - " + describe_taxon_candidate(candidate))
+            reject(kind, name, "ambiguous in the iNaturalist taxonomy", error)
+            continue
+        if not taxon:
+            message_callback(
+                f"Error: {kind.title()} '{name}' not found in iNaturalist taxonomy."
+            )
+            message_callback(
+                f"Please check the spelling or try a different {kind} name."
+            )
+            reject(kind, name, "not found in the iNaturalist taxonomy")
+            continue
+        message_callback(f"✓ {kind.title()} '{name}' verified in iNaturalist taxonomy.")
+        criteria.append(
+            _taxon_criterion(
+                kind,
+                name,
+                f"{kind} {name}",
+                taxon.get("id"),
+                name=name,
+                rank=rank,
+                taxon=taxon,
+            )
+        )
+
+    if args.taxon_id is not None:
+        # Malformed input is fatal in both modes: "abc" is not a clue that turned
+        # out to be wrong, it is a command line that cannot be read.
+        requested = parse_taxon_id_argument(args.taxon_id)
+        if requested is None:
+            detail = (
+                "--taxon-id must be a positive iNaturalist taxon ID "
+                f"(got '{args.taxon_id}')."
+            )
+            message_callback(f"Error: {detail}")
+            raise InputError(detail)
+        message_callback(f"Verifying taxon ID {requested} exists on iNaturalist...")
+        taxon = find_taxon_by_id(requested)
+        if not taxon:
+            message_callback(f"Error: Taxon ID {requested} not found on iNaturalist.")
+            message_callback(
+                "Please check the ID on iNaturalist, or search by name with --genus "
+                "or --family instead."
+            )
+            reject("taxon_id", args.taxon_id, "not found on iNaturalist")
+        else:
+            taxon_id = taxon.get("id") or requested
+            message_callback(
+                f"✓ Taxon ID {taxon_id} verified: {describe_taxon(taxon)}"
+            )
+            common_name = taxon.get("preferred_common_name")
+            if common_name:
+                message_callback(f"  Common name: {common_name}")
+            iconic_taxon = taxon.get("iconic_taxon_name")
+            if iconic_taxon:
+                message_callback(f"  Iconic taxon: {iconic_taxon}")
+            criteria.append(
+                _taxon_criterion(
+                    "taxon_id",
+                    args.taxon_id,
+                    format_taxon_reference(taxon, taxon_id),
+                    taxon_id,
+                    taxon=taxon,
+                )
+            )
+
+    if args.user:
+        message_callback(f"Verifying user '{args.user}' exists on iNaturalist...")
+        if verify_user_exists(args.user):
+            message_callback(f"✓ Username '{args.user}' verified on iNaturalist.")
+            criteria.append(_user_criterion(args.user))
+        else:
+            message_callback(f"Error: Username '{args.user}' not found on iNaturalist.")
+            message_callback("Please check the spelling or try a different username.")
+            reject("user", args.user, "not found on iNaturalist")
+
+    if args.project:
+        message_callback(f"Verifying project '{args.project}' exists on iNaturalist...")
+        project_key, project_metadata = resolve_project_identifier(
+            args.project, strict=strict, message_callback=message_callback
+        )
+        if project_key is None:
+            reject("project", args.project, "not found on iNaturalist")
+        else:
+            title = project_metadata.get("title", "Unknown Project")
+            pid = project_metadata.get("id")
+            slug = project_metadata.get("slug")
+            message_callback(f"✓ Project verified: {title} (ID: {pid}, Slug: {slug})")
+            if slug:
+                message_callback(
+                    f"  Project URL: https://www.inaturalist.org/projects/{slug}"
+                )
+            criteria.append(_project_criterion(args.project, f"project '{title}'"))
+            # A project on its own can be answered by filtering the main request,
+            # which is both cheaper and correct for collection projects. Sharing
+            # the search with other clues rules that out - the filter would hide
+            # every observation the other clues might have matched - so membership
+            # moves to a second request per batch instead.
+            if len(criteria) == 1 and not any(
+                getattr(args, other)
+                for other in ("genus", "family", "taxon_id", "user")
+            ):
+                project_id_param = project_key
+            else:
+                membership_project_id = project_key
+
+    return ResolvedCriteria(
+        criteria, unusable, project_id_param, membership_project_id, project_metadata
+    )
+
+
+def describe_taxon_candidate(taxon):
+    """Format one line of the homonym list shown for an ambiguous taxon name."""
+    details = [
+        f"ID: {taxon.get('id', 'unknown')}",
+        f"scientific name: {taxon.get('name', 'unknown')}",
+        f"rank: {taxon.get('rank', 'unknown')}",
+    ]
+    common_name = taxon.get("preferred_common_name")
+    if common_name:
+        details.append(f"common name: {common_name}")
+    iconic_taxon = taxon.get("iconic_taxon_name")
+    if iconic_taxon:
+        details.append(f"iconic taxon: {iconic_taxon}")
+    ancestors = taxon.get("ancestor_ids")
+    if ancestors:
+        details.append("ancestor IDs: " + ", ".join(str(value) for value in ancestors))
+    return "; ".join(details)
+
+
 def get_user_confirmation(prompt, default_yes=False, assume_yes=False):
     """
     Get yes/no confirmation from user with better input handling.
@@ -1418,7 +2214,926 @@ def get_user_confirmation(prompt, default_yes=False, assume_yes=False):
             print("Please enter 'y' or 'n'")
 
 
+SearchOutcome = namedtuple(
+    "SearchOutcome",
+    [
+        "status",
+        "stop_reason",
+        "matches",
+        "unusable",
+        "notices",
+        "original",
+        "stage",
+        "attempted",
+        "stage_total",
+        "unchecked",
+        "stages",
+        "resume",
+        "estimated_candidates",
+        "estimated_seconds",
+        "criteria",
+        "message",
+        # Whether the search actually ran to a conclusion. Stated rather than
+        # inferred from the status, because "paused before a stage we have not
+        # searched" and "finished, nothing there" are both non-failures and only
+        # one of them is complete.
+        "complete",
+        "exit_code",
+    ],
+)
+SearchOutcome.__new__.__defaults__ = (
+    None,  # stop_reason
+    (),  # matches
+    (),  # unusable
+    (),  # notices
+    None,  # original
+    None,  # stage
+    0,  # attempted
+    None,  # stage_total
+    0,  # unchecked
+    (),  # stages
+    None,  # resume
+    None,  # estimated_candidates
+    None,  # estimated_seconds
+    (),  # criteria
+    None,  # message
+    False,  # complete
+    None,  # exit_code
+)
+
+
+def outcome_is_complete(status, stop_reason):
+    """True only when the ladder really finished the work it set out to do.
+
+    ``needs_confirmation`` and a declined or over-sized stage all leave candidates
+    deliberately unsearched, so none of them may claim completeness even though
+    none of them is a failure either.
+    """
+    return status in ("match_found", "no_match") and stop_reason not in (
+        "declined",
+        "too_large",
+        "large_stage",
+        "early_exit",
+        "usage",
+        "bad_input",
+    )
+
+# The documented exit-code contract, expressed once. Callers must not invent a
+# status without deciding what it means to a script.
+STATUS_EXIT_CODES = {
+    "match_found": 0,
+    "no_match": 0,
+    "needs_confirmation": 0,
+    "incomplete": API_FAILURE_EXIT_CODE,
+    "cancelled": 130,
+    "error": 1,
+}
+
+
+def rank_matches(matches):
+    """Deduplicate by observation ID and sort best-first.
+
+    An observation can be scored more than once - the original number may also
+    turn up as a candidate - so the highest-scoring copy wins. Ties break on ID so
+    the order is stable between runs, which matters for a page that diffs results.
+    """
+    best = {}
+    for match in matches:
+        obs_id = match.observation.get("id")
+        current = best.get(obs_id)
+        if current is None or len(match.matched) > len(current.matched):
+            best[obs_id] = match
+    return sorted(
+        best.values(),
+        key=lambda match: (-len(match.matched), match.observation.get("id") or 0),
+    )
+
+
+def format_match_score(match, criteria):
+    """Render '2 of 3: genus, user; project: unknown' for one scored match."""
+    if not criteria:
+        return ""
+    parts = [f"{len(match.matched)} of {len(criteria)}"]
+    if match.matched:
+        parts.append(": " + ", ".join(match.matched))
+    if match.unknown:
+        parts.append("; " + ", ".join(match.unknown) + ": unknown")
+    return "".join(parts)
+
+
+def _observation_summary(observation, location):
+    """The fields both renderers show for one observation."""
+    obs_id = observation.get("id")
+    return {
+        "id": obs_id,
+        "taxon": (observation.get("taxon") or {}).get("name"),
+        "user": (observation.get("user") or {}).get("login"),
+        "location": location,
+        "url": f"https://www.inaturalist.org/observations/{obs_id}",
+    }
+
+
+def build_json_result(outcome, locations):
+    """Build the single JSON object a machine consumer reads off stdout."""
+    matches = []
+    for match in outcome.matches:
+        entry = _observation_summary(
+            match.observation, locations.get(match.observation.get("id"))
+        )
+        entry.update(
+            {
+                "score": len(match.matched),
+                "matched": list(match.matched),
+                "unknown": list(match.unknown),
+                "stage": match.stage,
+            }
+        )
+        matches.append(entry)
+
+    original = None
+    if outcome.original is not None:
+        original = _observation_summary(
+            outcome.original, locations.get(outcome.original.get("id"))
+        )
+
+    return {
+        "version": JSON_RESULT_VERSION,
+        "status": outcome.status,
+        "complete": bool(outcome.complete),
+        "exit_code": (
+            outcome.exit_code
+            if outcome.exit_code is not None
+            else STATUS_EXIT_CODES.get(outcome.status, 1)
+        ),
+        "stop_reason": outcome.stop_reason,
+        "stage": outcome.stage,
+        "attempted": outcome.attempted,
+        "stage_total": outcome.stage_total,
+        "unchecked": outcome.unchecked,
+        "clues": [criterion.kind for criterion in outcome.criteria],
+        "matches": matches,
+        "original": original,
+        "unusable_clues": [
+            {"kind": clue.kind, "value": clue.value, "reason": clue.reason}
+            for clue in outcome.unusable
+        ],
+        "notices": list(outcome.notices),
+        "stages": [dict(stage) for stage in outcome.stages],
+        "estimated_candidates": outcome.estimated_candidates,
+        "estimated_seconds": outcome.estimated_seconds,
+        "resume": dict(outcome.resume) if outcome.resume else None,
+        "message": outcome.message,
+    }
+
+
+def print_outcome(outcome, locations, obs_number, message_callback=None):
+    """Print the human-readable summary of a finished (or stopped) search."""
+    if message_callback is None:
+        message_callback = print
+
+    if outcome.status == "cancelled":
+        message_callback("\nSearch interrupted!")
+    elif outcome.status == "incomplete":
+        message_callback("\nSearch incomplete - results may be incomplete.")
+    elif outcome.status == "needs_confirmation":
+        message_callback("\nSearch paused before a much larger stage.")
+    else:
+        message_callback("\nSearch complete!")
+
+    if outcome.unchecked:
+        message_callback(
+            f"\nWarning: {outcome.unchecked} candidate(s) could not be checked "
+            "because iNaturalist requests failed."
+        )
+
+    for clue in outcome.unusable:
+        message_callback(
+            f"\nNote: the {clue.kind} clue '{clue.value}' was unusable "
+            f"({clue.reason}); the search ran without it."
+        )
+
+    for notice in outcome.notices:
+        message_callback(f"\nNote: {notice}")
+
+    if outcome.matches:
+        if outcome.status == "cancelled":
+            suffix = " so far (partial results)"
+        elif outcome.status == "incomplete":
+            suffix = " (partial results)"
+        else:
+            suffix = ""
+        message_callback(
+            f"\nFound {len(outcome.matches)} potential matches{suffix}:"
+        )
+        for position, match in enumerate(outcome.matches, 1):
+            observation = match.observation
+            obs_id = observation.get("id")
+            taxon_name = (observation.get("taxon") or {}).get("name", "Unknown taxon")
+            creator = (observation.get("user") or {}).get("login", "Unknown user")
+            location = locations.get(obs_id, "Unknown location")
+            score = format_match_score(match, outcome.criteria)
+            heading = f"{position}. Observation #{obs_id} - {taxon_name}"
+            if score:
+                heading += f"   [{score}]"
+            message_callback(heading)
+            message_callback(f"   Created by: {creator}")
+            message_callback(f"   Location: {location}")
+            message_callback(
+                f"   URL: https://www.inaturalist.org/observations/{obs_id}"
+            )
+            if match.stage is not None:
+                message_callback(f"   Found at stage {match.stage}")
+
+        best = len(outcome.matches[0].matched)
+        if outcome.criteria and best < len(outcome.criteria):
+            message_callback(
+                "\nNo observation matched every clue. When the best match is a "
+                "partial one, the element that is wrong is often a clue rather "
+                "than the number."
+            )
+    elif outcome.original is not None and not outcome.criteria:
+        observation = outcome.original
+        obs_id = observation.get("id")
+        message_callback(
+            f"\nObservation #{obs_id} exists: "
+            f"{(observation.get('taxon') or {}).get('name', 'Unknown taxon')}"
+        )
+        message_callback(
+            f"   Created by: {(observation.get('user') or {}).get('login', 'Unknown user')}"
+        )
+        message_callback(
+            f"   Location: {locations.get(obs_id, 'Unknown location')}"
+        )
+        message_callback(f"   URL: https://www.inaturalist.org/observations/{obs_id}")
+
+    if outcome.message:
+        message_callback(f"\n{outcome.message}")
+
+    if outcome.resume:
+        message_callback("\nTo keep searching from here, re-run with:")
+        message_callback(f"  --auto-resume {outcome.resume['token']}")
+
+    return outcome
+
+
+PassResult = namedtuple(
+    "PassResult",
+    [
+        "matches",
+        "unchecked",
+        "consumed",
+        "stopped_early",
+        "membership_unknown",
+        "interrupted",
+    ],
+)
+PassResult.__new__.__defaults__ = (False,)
+
+
+def score_observation(observation, context, criteria):
+    """Return ``(matched_kinds, unknown_kinds)`` for one observation.
+
+    Scoring is any-of on purpose. Requiring every clue to agree would hide the
+    real observation whenever one supplied element was itself wrong, which is the
+    common case this feature exists for; ranking by how many clues agreed keeps
+    the best answer at the top without throwing the near misses away.
+    """
+    matched = []
+    unknown = []
+    for criterion in criteria:
+        verdict = criterion.evaluate(observation, context)
+        if verdict is Evidence.MATCH:
+            matched.append(criterion.kind)
+        elif verdict is Evidence.UNKNOWN:
+            unknown.append(criterion.kind)
+    return matched, unknown
+
+
+def is_full_match(matched, criteria):
+    """True when every clue agreed. An UNKNOWN clue can never make this true."""
+    return bool(criteria) and len(matched) == len(criteria)
+
+
+def run_one_pass(
+    candidates,
+    total,
+    criteria,
+    stage_index=None,
+    project_id_param=None,
+    membership_project_id=None,
+    stop_on_full_match=False,
+    show_progress=True,
+    verbose=False,
+    message_callback=None,
+):
+    """Check one set of candidates against every clue, and report what matched.
+
+    This is the single-pass unit the ladder repeats. ``stop_on_full_match`` is
+    what makes "stops at the first hit" literally true: without it, a hit in the
+    first batch of a 59,000-candidate stage would still cost the whole stage.
+    Every match in the batch that triggered the stop is kept; the candidates never
+    requested are reported through ``consumed``, not as unchecked, because nothing
+    failed.
+
+    Ctrl+C is caught here rather than left to propagate, so that matches already
+    found earlier in this stage are returned instead of being lost with the stack
+    frame. "Ctrl+C prints what was found so far" has to include the stage that was
+    running when the key was pressed.
+    """
+    if message_callback is None:
+        message_callback = print
+
+    pbar = None
+    if show_progress and total:
+        pbar = tqdm(total=total, desc="Checking variations", unit="var")
+
+    matches = []
+    unchecked_reported = 0
+    found_full = False
+    context_holder = [BatchContext()]
+
+    def output(message):
+        """Write without corrupting an active tqdm display."""
+        if pbar is not None:
+            pbar.write(message)
+        else:
+            message_callback(message)
+
+    def report_progress(count, checked):
+        """Advance the bar only for candidates that were really checked."""
+        nonlocal unchecked_reported
+        if checked:
+            if pbar is not None:
+                pbar.update(count)
+            return
+        unchecked_reported += count
+        if pbar is not None:
+            pbar.set_postfix_str(f"{unchecked_reported} unchecked")
+
+    def describe_batch(batch, start, batch_total):
+        if verbose:
+            output(
+                f"\nChecking batch of {len(batch)} variations "
+                f"({start + 1}-{start + len(batch)} of {batch_total})"
+            )
+            output(f"Variations in this batch: {', '.join(batch)}")
+
+    def record_context(context):
+        context_holder[0] = context
+
+    def evaluate_results(batch_results):
+        """Score each batch's observations as soon as the batch comes back."""
+        nonlocal found_full
+        context = context_holder[0]
+        for observation in batch_results:
+            if not isinstance(observation, dict):
+                continue
+            matched, unknown = score_observation(observation, context, criteria)
+            if not matched:
+                if verbose:
+                    output(
+                        f"✗ Observation {observation.get('id')} matched none of "
+                        "the clues"
+                    )
+                continue
+            matches.append(ScoredMatch(observation, matched, unknown, stage_index))
+            if is_full_match(matched, criteria):
+                found_full = True
+            if verbose:
+                output(
+                    f"✓ Match found: Observation {observation.get('id')} matched "
+                    f"{', '.join(matched)}"
+                )
+
+    def should_stop():
+        return stop_on_full_match and found_full
+
+    try:
+        result = batch_check_observations(
+            candidates,
+            BATCH_SIZE,
+            project_id=project_id_param,
+            progress_callback=report_progress,
+            batch_callback=describe_batch,
+            results_callback=evaluate_results,
+            context_callback=record_context,
+            stop_callback=should_stop,
+            membership_project_id=membership_project_id,
+            message_callback=output,
+            total=total,
+            collect_results=False,
+        )
+    except SearchInterrupted as error:
+        partial = error.result
+        return PassResult(
+            matches,
+            partial.unchecked,
+            partial.consumed,
+            partial.stopped_early,
+            partial.membership_unknown,
+            True,
+        )
+    except KeyboardInterrupt:
+        # Interrupted outside the batch loop, so there are no partial counts.
+        return PassResult(matches, 0, 0, False, 0, True)
+    finally:
+        if pbar is not None:
+            pbar.close()
+
+    return PassResult(
+        matches,
+        result.unchecked,
+        result.consumed,
+        result.stopped_early,
+        result.membership_unknown,
+    )
+
+
+def stdin_is_interactive():
+    """True when there is a human at a terminal who could answer a prompt."""
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def estimate_stage_seconds(total, membership_project_id=None):
+    """Roughly how long a stage will take, in seconds.
+
+    Combining --project with other clues costs a second request per batch, since
+    the main request cannot be filtered by the project without hiding everything
+    the other clues might have matched.
+    """
+    batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+    if membership_project_id:
+        batches *= 2
+    return int(batches * 1.5)
+
+
+def check_original_observation(obs_number, resolved, message_callback=None):
+    """Fetch the number as supplied and score it. Stage 0 of the ladder.
+
+    Returns ``(observation_or_None, matched, unknown, failed, membership_unknown)``.
+    ``failed`` means the observation request could not be completed, which is not
+    the same as the observation not existing and must not be reported as such.
+    ``membership_unknown`` means the observation came back but its project
+    membership could not be checked - reported separately because it leaves the
+    search incomplete just as surely, and stage 0 is never re-run on a resume.
+
+    Unlike the later stages, this request is never filtered by project. Stage 0
+    asks "what is this number?", and a project filter answers a different
+    question: it would hide a real observation that simply is not a member,
+    leaving the run to report it as nonexistent. Membership is asked separately
+    so that "not in the project" stays distinct from "not there at all".
+    """
+    if message_callback is None:
+        message_callback = print
+    try:
+        found = fetch_observations([obs_number])
+    except ApiError as error:
+        message_callback(
+            f"Warning: could not check the original observation number - {error}"
+        )
+        return None, [], [], True, False
+
+    if not found:
+        return None, [], [], False, False
+
+    observation = found[0]
+    membership_unknown = False
+    context = BatchContext()
+    project_id = resolved.project_id_param or resolved.membership_project_id
+    if project_id:
+        try:
+            context = BatchContext(
+                project_member_ids=fetch_project_membership([obs_number], project_id)
+            )
+        except ApiError as error:
+            # Stage 0 is not repeated when a search resumes, so an unanswered
+            # question here would otherwise be skipped for good.
+            membership_unknown = True
+            message_callback(
+                f"Warning: could not check project membership for the original "
+                f"observation number - {error}"
+            )
+
+    matched, unknown = score_observation(observation, context, resolved.criteria)
+    return observation, matched, unknown, False, membership_unknown
+
+
+def run_auto_mode(
+    obs_number,
+    resolved,
+    digits_cap,
+    resume_token=None,
+    assume_yes=False,
+    as_json=False,
+    show_progress=True,
+    verbose=False,
+    message_callback=None,
+):
+    """Climb the ladder of typo hypotheses until something matches, or nothing does.
+
+    The ladder is stage 0 (the number exactly as supplied) then one plan per
+    ``digits_off`` up to ``digits_cap``, each stage yielding only what earlier
+    stages did not already try. It stops at the first *full* match - one where
+    every usable clue agreed - because a partial match usually means one of the
+    clues is itself wrong, and that is worth widening the search to check. With a
+    single clue, full score is one, so this is exactly "stop at the first hit".
+    """
+    if message_callback is None:
+        message_callback = print
+
+    criteria = resolved.criteria
+    fingerprint = search_fingerprint(obs_number, criteria, digits_cap)
+    interactive = stdin_is_interactive() and not as_json
+
+    seen_ids = set()
+    start_stage = 1
+    resuming = False
+    if resume_token:
+        try:
+            start_stage, start_offset, token_fingerprint = parse_resume_token(
+                resume_token
+            )
+        except ValueError as error:
+            return SearchOutcome(
+                status="error",
+                stop_reason="bad_resume",
+                message=str(error),
+                exit_code=1,
+            )
+        if token_fingerprint != fingerprint:
+            return SearchOutcome(
+                status="error",
+                stop_reason="bad_resume",
+                message=(
+                    "This resume token belongs to a different search. Tokens are "
+                    "bound to the observation number, the clues and the --digits "
+                    "cap, so that a cursor can never be replayed against a search "
+                    "it did not come from. Start again without --auto-resume."
+                ),
+                exit_code=1,
+            )
+        if not 1 <= start_stage <= digits_cap:
+            return SearchOutcome(
+                status="error",
+                stop_reason="bad_resume",
+                message=(
+                    f"This resume token points at stage {start_stage}, which is "
+                    f"not a stage this search has (1 to {digits_cap}). Raise "
+                    "--digits if you meant to search further."
+                ),
+                exit_code=1,
+            )
+        resume_plan_total = build_candidate_plan(obs_number, start_stage).total
+        if not 0 <= start_offset <= resume_plan_total:
+            return SearchOutcome(
+                status="error",
+                stop_reason="bad_resume",
+                message=(
+                    f"This resume token points {start_offset} candidate(s) into "
+                    f"stage {start_stage}, which only has {resume_plan_total}."
+                ),
+                exit_code=1,
+            )
+        seen_ids = restore_seen_ids(obs_number, start_stage, start_offset)
+        resuming = True
+        message_callback(
+            f"Resuming at stage {start_stage}, {len(seen_ids)} candidate(s) "
+            "already tried."
+        )
+
+    matches = []
+    notices = []
+    stages = []
+    unchecked_total = 0
+    membership_unknown_total = 0
+    original = None
+    interrupted = False
+    stop_reason = "exhausted"
+    last_stage = None
+    last_attempted = 0
+    last_stage_total = None
+    resume = None
+
+    def cursor(stage_index, offset):
+        """A resume cursor, but only when nothing was left unchecked.
+
+        A failed batch's IDs are already in ``seen_ids``, so a cursor issued after
+        a failure would skip them forever and quietly report a clean "no match"
+        over a gap. Until the cursor can carry those IDs, a search with anything
+        unchecked is retried from the beginning instead.
+        """
+        if unchecked_total or membership_unknown_total:
+            return None
+        if stage_index > digits_cap:
+            return None
+        return {
+            "stage": stage_index,
+            "offset": offset,
+            "token": build_resume_token(stage_index, offset, fingerprint),
+        }
+
+    def finish(status, reason, message=None, estimated=None, seconds=None):
+        """Assemble the outcome, and never let a failure hide behind a clean status.
+
+        Every early return comes through here so that one rule holds everywhere:
+        if anything went unchecked, the search is incomplete and says so. Reporting
+        "no match", or pausing for confirmation, over a gap left by a failed
+        request would be exactly the false negative this tool is built to avoid.
+        """
+        if status not in ("cancelled", "error") and (
+            unchecked_total or membership_unknown_total
+        ):
+            status, reason = "incomplete", "failures"
+            if membership_unknown_total and not message:
+                message = (
+                    "Project membership could not be checked for part of this "
+                    "search, so the project clue is unknown for some results."
+                )
+        return SearchOutcome(
+            status=status,
+            stop_reason=reason,
+            matches=rank_matches(matches),
+            unusable=tuple(resolved.unusable),
+            notices=tuple(notices),
+            original=original,
+            stage=last_stage,
+            attempted=last_attempted,
+            stage_total=last_stage_total,
+            unchecked=unchecked_total,
+            stages=tuple(stages),
+            resume=resume,
+            estimated_candidates=estimated,
+            estimated_seconds=seconds,
+            criteria=tuple(criteria),
+            message=message,
+            complete=outcome_is_complete(status, reason),
+            exit_code=STATUS_EXIT_CODES.get(status, 1),
+        )
+
+    try:
+        if not resuming:
+            last_stage = 0
+            (
+                observation,
+                matched,
+                unknown,
+                failed,
+                original_membership_unknown,
+            ) = check_original_observation(
+                obs_number, resolved, message_callback=message_callback
+            )
+            if failed:
+                unchecked_total += 1
+            if original_membership_unknown:
+                membership_unknown_total += 1
+            if observation is not None:
+                original = observation
+                last_attempted = 1
+                last_stage_total = 1
+                stages.append(
+                    {"stage": 0, "total": 1, "attempted": 1, "unchecked": 0}
+                )
+                if matched:
+                    matches.append(ScoredMatch(observation, matched, unknown, 0))
+                if is_full_match(matched, criteria):
+                    message_callback(
+                        f"✓ The observation number {obs_number} as supplied "
+                        "matches every clue."
+                    )
+                    resume = cursor(1, 0)
+                    return finish("match_found", "full_match")
+                if criteria:
+                    # The number points at a real observation, just not the one
+                    # the clues describe. Worth saying out loud: it is the first
+                    # thing a reader wants to know before the ladder starts.
+                    message_callback(
+                        f"Observation #{observation.get('id', obs_number)} exists "
+                        f"but matched {len(matched)} of {len(criteria)} clue(s): "
+                        f"{(observation.get('taxon') or {}).get('name', 'Unknown taxon')}"
+                        f", by {(observation.get('user') or {}).get('login', 'Unknown user')}."
+                    )
+            else:
+                stages.append(
+                    {
+                        "stage": 0,
+                        "total": 1,
+                        "attempted": 0 if failed else 1,
+                        "unchecked": 1 if failed else 0,
+                    }
+                )
+                if failed:
+                    # check_original_observation() has already explained the
+                    # failure. Saying "does not exist" here would turn an outage
+                    # into a fact about the observation.
+                    message_callback(
+                        f"Observation {obs_number} as supplied could not be "
+                        "checked; the ladder will continue."
+                    )
+                else:
+                    message_callback(
+                        f"Observation {obs_number} as supplied does not exist on "
+                        "iNaturalist."
+                    )
+
+        if not criteria:
+            # Nothing to filter on. Enumerating thousands of neighbouring IDs
+            # would return every observation that happens to exist near this
+            # number, which is noise rather than an answer.
+            return finish(
+                "no_match",
+                "no_clues",
+                "No usable clue was supplied, so there was nothing to search for. "
+                "Add --genus, --family, --taxon-id, --user or --project to widen "
+                "the search beyond the number as given.",
+            )
+
+        for index in range(max(1, start_stage), digits_cap + 1):
+            plan = build_candidate_plan(obs_number, index)
+            stage = AutoStage(index, plan, seen_ids)
+            last_stage = index
+            last_stage_total = stage.total
+            last_attempted = 0
+            if stage.total <= 0:
+                continue
+
+            if stage.total > MAX_SEARCH_CANDIDATES:
+                # This stage was never searched, so the run has not established
+                # that there is nothing there. Saying "no match" would be a lie.
+                return finish(
+                    "error",
+                    "too_large",
+                    f"Stage {index} would need {stage.total} API-checked "
+                    f"candidates, more than the limit of {MAX_SEARCH_CANDIDATES}. "
+                    "Lower --digits.",
+                )
+
+            seconds = estimate_stage_seconds(
+                stage.total, resolved.membership_project_id
+            )
+            message_callback(
+                f"\nStage {index}: {stage.label} - {stage.total} new candidate(s), "
+                f"about {timedelta(seconds=seconds)}"
+            )
+
+            if stage.total > LARGE_SEARCH_THRESHOLD and not assume_yes:
+                if not interactive:
+                    # No one is there to answer. Stop cleanly and hand back a
+                    # cursor so the caller can decide and continue, rather than
+                    # blocking on a prompt or silently spending seven minutes.
+                    resume = cursor(index, 0)
+                    return finish(
+                        "needs_confirmation",
+                        "large_stage",
+                        f"Stage {index} would check {stage.total} more "
+                        "possibilities. Re-run with --yes and the resume token "
+                        "to continue.",
+                        estimated=stage.total,
+                        seconds=seconds,
+                    )
+                if not get_user_confirmation(
+                    f"This is a large stage ({stage.total} variations). Continue? (y/n): "
+                ):
+                    resume = cursor(index, 0)
+                    return finish(
+                        "no_match" if not matches else "match_found",
+                        "declined",
+                        "Stopped before the larger stage at your request.",
+                    )
+
+            result = run_one_pass(
+                stage,
+                stage.total,
+                criteria,
+                stage_index=index,
+                project_id_param=resolved.project_id_param,
+                membership_project_id=resolved.membership_project_id,
+                stop_on_full_match=True,
+                show_progress=show_progress,
+                verbose=verbose,
+                message_callback=message_callback,
+            )
+            matches.extend(result.matches)
+            unchecked_total += result.unchecked
+            membership_unknown_total += result.membership_unknown
+            last_attempted = result.consumed
+            stages.append(
+                {
+                    "stage": index,
+                    "total": stage.total,
+                    "attempted": result.consumed,
+                    "unchecked": result.unchecked,
+                }
+            )
+
+            if result.interrupted:
+                # The matches this stage had already found are in hand, and are
+                # reported rather than lost with the interrupted call.
+                interrupted = True
+                break
+
+            if any(
+                is_full_match(match.matched, criteria) for match in result.matches
+            ):
+                stop_reason = "full_match"
+                if stage.exhausted():
+                    resume = cursor(index + 1, 0)
+                else:
+                    # The message counts new candidates, which is what the stage
+                    # announced; the cursor counts plan entries, which is what a
+                    # resume has to replay. They are deliberately different numbers.
+                    resume = cursor(index, stage.plan_position)
+                    message_callback(
+                        f"\nStopped at stage {index} after {result.consumed} of "
+                        f"{stage.total} new candidate(s) because a full match "
+                        "was found."
+                    )
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+
+    if interrupted:
+        return finish("cancelled", "interrupted")
+    if matches:
+        return finish("match_found", stop_reason)
+    return finish("no_match", stop_reason)
+
+
 def run_search():
+    """Choose the output surface, then run the search.
+
+    With --json the caller wants exactly one JSON object on stdout, so every human
+    line the search prints is redirected to stderr for the duration and the result
+    object is written afterwards. Redirecting is what makes this possible without
+    rewriting the ~80 print() calls the text mode is built from.
+
+    Argument parsing happens *inside* that machinery, not before it. A missing
+    observation number, an unknown option or two conflicting criteria are exactly
+    the cases a web front end most needs a readable answer for, and they are also
+    the cases argparse would otherwise exit on before any JSON existed.
+    """
+    if not wants_json(sys.argv):
+        # Pre-process sys.argv to handle unquoted project names
+        sys.argv = preprocess_argv_for_project_name(sys.argv)
+        return execute_search(parse_arguments())
+
+    sink = {}
+    status = 0
+    message = None
+    reason = "early_exit"
+    try:
+        with contextlib.redirect_stdout(sys.stderr):
+            sys.argv = preprocess_argv_for_project_name(sys.argv)
+            status = execute_search(parse_arguments(), sink) or 0
+    except UsageError as error:
+        # Argparse's own status is 2, the same as an unreachable API. The status
+        # string is what tells the two apart, which is the point of --json.
+        status, message, reason = 2, error.message, "usage"
+    except InputError as error:
+        status, message, reason = 1, error.message, "bad_input"
+    except SystemExit as exit_error:
+        status = exit_error.code or 0
+    except KeyboardInterrupt:
+        status, reason = 130, "interrupted"
+    except ApiError as error:
+        status, message, reason = API_FAILURE_EXIT_CODE, str(error), "api_error"
+
+    if "result" not in sink:
+        # An exit path that never built a result: bad input, or a refusal. None of
+        # them ran a search to completion, so none of them claim to be complete.
+        fallback = {
+            0: "no_match",
+            1: "error",
+            API_FAILURE_EXIT_CODE: "incomplete",
+            130: "cancelled",
+        }.get(status, "error")
+        if reason in ("usage", "bad_input"):
+            fallback = "error"
+        sink["result"] = build_json_result(
+            SearchOutcome(
+                status=fallback,
+                stop_reason=reason,
+                message=message,
+                complete=False,
+                exit_code=status,
+            ),
+            {},
+        )
+
+    print(json.dumps(sink["result"], indent=2))
+    return status
+
+
+def _emit(sink, outcome, locations):
+    """Record a finished outcome for the JSON writer, when one is listening."""
+    if sink is not None:
+        sink["result"] = build_json_result(outcome, locations)
+    return STATUS_EXIT_CODES.get(outcome.status, 1)
+
+
+def execute_search(args, sink=None):
     """
     Executes the iNaturalist observation finder process.
 
@@ -1440,21 +3155,17 @@ def run_search():
 
     Note: This function interacts with the user via input prompts and exits if critical validation fails.
     """
-    # Pre-process sys.argv to handle unquoted project names
-    sys.argv = preprocess_argv_for_project_name(sys.argv)
-
-    args = parse_arguments()
-
     genus = args.genus
     family = args.family
-    taxon_id_input = args.taxon_id
     username = args.user
-    project_input = args.project
     obs_input = args.observation_number
     digits_off = args.digits
     verbose = args.verbose
     show_progress = not args.no_progress
     assume_yes = args.yes
+    auto = args.auto
+    as_json = args.json
+    notices = []
 
     start_time = time.time()
 
@@ -1464,105 +3175,24 @@ def run_search():
 
     if digits_off < 0:
         print("Error: --digits must be 0 or greater.")
-        sys.exit(1)
+        raise InputError("--digits must be 0 or greater.")
     if digits_off == 0:
         print("Note: --digits 0 only checks the original observation number.")
 
-    # Determine search mode
-    if genus:
-        search_mode = "genus"
-        search_term = genus
-    elif family:
-        search_mode = "family"
-        search_term = family
-    elif taxon_id_input is not None:
-        search_mode = "taxon_id"
-        search_term = taxon_id_input
-    elif username:
-        search_mode = "user"
-        search_term = username
-    else:
-        search_mode = "project"
-        search_term = project_input
+    # Every clue - one here, possibly several under --auto - is verified through
+    # the same resolver, so there is one verification code path rather than two.
+    resolved = resolve_criteria(args, strict=not auto)
 
-    project_id_param = None
-    project_metadata = None
-    # Verified taxon metadata shared by the genus, family and --taxon-id paths.
-    # Once it is set, matching is decided purely from taxon IDs.
-    target_taxon = None
-    target_taxon_id = None
-    taxon_display = None
-
-    # Validate the requested taxon ID before any request, so bad input exits 1
-    # and is never confused with a lookup failure.
-    requested_taxon_id = None
-    if search_mode == "taxon_id":
-        requested_taxon_id = parse_taxon_id_argument(taxon_id_input)
-        if requested_taxon_id is None:
-            print(
-                "Error: --taxon-id must be a positive iNaturalist taxon ID "
-                f"(got '{taxon_id_input}')."
-            )
-            sys.exit(1)
-
-    # Verify that the taxon, user, or project exists before proceeding.
-    # An ApiError here propagates to main(), which reports an operational failure
-    # instead of claiming the taxon, user, or project does not exist.
-    if search_mode == "taxon_id":
-        print(f"Verifying taxon ID {requested_taxon_id} exists on iNaturalist...")
-    else:
-        print(f"Verifying {search_mode} '{search_term}' exists on iNaturalist...")
-
-    if search_mode == "taxon_id":
-        target_taxon = find_taxon_by_id(requested_taxon_id)
-        if not target_taxon:
-            print(f"Error: Taxon ID {requested_taxon_id} not found on iNaturalist.")
-            print(
-                "Please check the ID on iNaturalist, or search by name with --genus "
-                "or --family instead."
-            )
-            sys.exit(1)
-        target_taxon_id = target_taxon.get("id") or requested_taxon_id
-        print(f"✓ Taxon ID {target_taxon_id} verified: {describe_taxon(target_taxon)}")
-        common_name = target_taxon.get("preferred_common_name")
-        if common_name:
-            print(f"  Common name: {common_name}")
-        iconic_taxon = target_taxon.get("iconic_taxon_name")
-        if iconic_taxon:
-            print(f"  Iconic taxon: {iconic_taxon}")
-        taxon_display = format_taxon_reference(target_taxon, target_taxon_id)
-
-    elif search_mode in ("genus", "family"):
-        try:
-            verified_taxon = find_taxon(search_term, search_mode)
-        except TaxonAmbiguityError as error:
-            print(
-                f"Error: {search_mode.title()} '{search_term}' is ambiguous in "
-                "the iNaturalist taxonomy."
-            )
-            print("Exact matches:")
-            for taxon in error.candidates:
-                details = [
-                    f"ID: {taxon.get('id', 'unknown')}",
-                    f"scientific name: {taxon.get('name', 'unknown')}",
-                    f"rank: {taxon.get('rank', 'unknown')}",
-                ]
-                common_name = taxon.get("preferred_common_name")
-                if common_name:
-                    details.append(f"common name: {common_name}")
-                iconic_taxon = taxon.get("iconic_taxon_name")
-                if iconic_taxon:
-                    details.append(f"iconic taxon: {iconic_taxon}")
-                ancestors = taxon.get("ancestor_ids")
-                if ancestors:
-                    details.append(
-                        "ancestor IDs: " + ", ".join(str(value) for value in ancestors)
-                    )
-                print("  - " + "; ".join(details))
+    if resolved.unusable and not auto:
+        # A normal search has exactly one criterion, so an unresolvable one is
+        # fatal, exactly as before. resolve_criteria() has already explained why;
+        # an ambiguous name additionally gets the ready-to-paste re-run command.
+        clue = resolved.unusable[0]
+        if clue.ambiguity is not None:
             example_id = next(
                 (
                     taxon.get("id")
-                    for taxon in error.candidates
+                    for taxon in clue.ambiguity.candidates
                     if taxon.get("id") is not None
                 ),
                 "ID",
@@ -1579,34 +3209,29 @@ def run_search():
             print("Re-run the search using the desired taxon ID, for example:")
             print()
             print(example_command)
-            return 1
-        if not verified_taxon:
-            print(
-                f"Error: {search_mode.title()} '{search_term}' not found in iNaturalist taxonomy."
-            )
-            print(f"Please check the spelling or try a different {search_mode} name.")
-            sys.exit(1)
-        target_taxon = verified_taxon
-        target_taxon_id = verified_taxon.get("id")
-        print(
-            f"✓ {search_mode.title()} '{search_term}' verified in iNaturalist taxonomy."
+        # Record the reason rather than only printing it, so --json reports the
+        # same explanation a person reads on the terminal.
+        return _emit(
+            sink,
+            SearchOutcome(
+                status="error",
+                stop_reason="bad_input",
+                message=f"{clue.kind} '{clue.value}': {clue.reason}",
+                unusable=tuple(resolved.unusable),
+                complete=False,
+                exit_code=1,
+            ),
+            {},
         )
 
-    elif search_mode == "user":
-        if not verify_user_exists(username):
-            print(f"Error: Username '{username}' not found on iNaturalist.")
-            print("Please check the spelling or try a different username.")
-            sys.exit(1)
-        print(f"✓ Username '{username}' verified on iNaturalist.")
-
-    elif search_mode == "project":
-        project_id_param, project_metadata = resolve_project_identifier(project_input)
-        title = project_metadata.get("title", "Unknown Project")
-        pid = project_metadata.get("id")
-        slug = project_metadata.get("slug")
-        print(f"✓ Project verified: {title} (ID: {pid}, Slug: {slug})")
-        if slug:
-            print(f"  Project URL: https://www.inaturalist.org/projects/{slug}")
+    project_id_param = resolved.project_id_param
+    project_metadata = resolved.project_metadata
+    criterion = resolved.criteria[0] if resolved.criteria else None
+    search_mode = criterion.kind if criterion else None
+    search_term = criterion.value if criterion else None
+    target_taxon = criterion.taxon if criterion else None
+    target_taxon_id = criterion.taxon_id if criterion else None
+    taxon_display = criterion.label if search_mode == "taxon_id" else None
 
     # Parse URL if provided
     obs_number = parse_inat_url(obs_input)
@@ -1619,7 +3244,9 @@ def run_search():
     if not obs_number.isdigit():
         print("Error: Observation number must contain only digits")
         print("Input provided: " + obs_input)
-        sys.exit(1)
+        raise InputError(
+            f"Observation number must contain only digits (got '{obs_input}')."
+        )
 
     # Observation IDs have no leading zeroes; normalising keeps candidate counting
     # exact and avoids generating IDs the API would never accept.
@@ -1630,29 +3257,117 @@ def run_search():
 
     # Check for Mushroom Observer numbers (5 digits or less)
     if len(obs_number) <= 5:
+        short_note = (
+            f"The observation number {obs_number} is very short (5 digits or less); "
+            "it might be a Mushroom Observer observation rather than an "
+            f"iNaturalist one - https://mushroomobserver.org/{obs_number}"
+        )
         print(
             f"Note: The observation number {obs_number} is very short (5 digits or less)."
         )
         print("This might be a Mushroom Observer observation rather than iNaturalist.")
         print(f"Consider checking: https://mushroomobserver.org/{obs_number}")
 
-        if not confirm("Continue with iNaturalist search anyway? (y/n): "):
+        if auto:
+            # In auto mode this is a hint, not a gate. Stopping the whole search
+            # to ask about it would make the mode useless to a caller that cannot
+            # answer, and the note is carried through to the result either way.
+            notices.append(short_note)
+        elif not confirm("Continue with iNaturalist search anyway? (y/n): "):
             print("Exiting search.")
             return 0
 
-    def print_summary(found, interrupted=False, unchecked=0, message_callback=print):
-        """Print the deduplicated match list, search state, and elapsed time."""
+    if auto:
+        outcome = run_auto_mode(
+            obs_number,
+            resolved,
+            digits_off,
+            resume_token=args.auto_resume,
+            assume_yes=assume_yes,
+            as_json=as_json,
+            show_progress=show_progress,
+            verbose=verbose,
+        )
+        outcome = outcome._replace(notices=tuple(notices) + tuple(outcome.notices))
+        reported = list(outcome.matches)
+        if outcome.original is not None:
+            reported.append(
+                ScoredMatch(outcome.original, [], [], None)
+            )
+        locations = resolve_observation_locations(
+            [match.observation for match in reported]
+        )
+        print_outcome(outcome, locations, obs_number)
+        print(f"\nTotal time: {timedelta(seconds=int(time.time() - start_time))}")
+        return _emit(sink, outcome, locations)
+
+    def emit_recorded():
+        """Hand the recorded outcome to the JSON writer, when one is listening."""
+        if sink is not None and recorded:
+            sink["result"] = build_json_result(recorded[0], recorded[1])
+
+    def print_summary(
+        found,
+        interrupted=False,
+        unchecked=0,
+        message_callback=print,
+        original=None,
+        declined=False,
+    ):
+        """Print the deduplicated match list, search state, and elapsed time.
+
+        ``original`` is the observation the supplied number really points at, when
+        one came back, so a JSON consumer can show what that number references
+        whether or not it matched the search criteria. ``declined`` marks the exits
+        where the user stopped before the variations were checked: those results
+        are real, but the search did not run to a conclusion and may not claim to
+        have exhausted anything.
+        """
         # Defensive API-result deduplication: an ID should only be reported once.
         # This also collapses the original observation if a candidate returned it.
         deduplicated = list({match.get("id"): match for match in found}.values())
+        # The supplied observation is reported in its own field even when it did
+        # not match, so its location has to be resolved alongside the matches.
         location_labels = resolve_observation_locations(
-            deduplicated, message_callback=message_callback
+            deduplicated + ([original] if original is not None else []),
+            message_callback=message_callback,
         )
+        if interrupted:
+            json_status, json_reason = "cancelled", "interrupted"
+        elif unchecked:
+            json_status, json_reason = "incomplete", "failures"
+        elif deduplicated:
+            json_status, json_reason = "match_found", "exhausted"
+        else:
+            json_status, json_reason = "no_match", "exhausted"
+        if declined and json_reason == "exhausted":
+            # Nothing but the number as supplied was ever checked, so the
+            # unsearched variations must not be reported as conclusively absent.
+            json_reason = "declined"
+        recorded[:] = [
+            SearchOutcome(
+                status=json_status,
+                stop_reason=json_reason,
+                matches=tuple(
+                    ScoredMatch(observation, [search_mode], [], None)
+                    for observation in deduplicated
+                ),
+                notices=tuple(notices),
+                original=original,
+                unchecked=unchecked,
+                criteria=tuple(resolved.criteria),
+                complete=outcome_is_complete(json_status, json_reason),
+                exit_code=STATUS_EXIT_CODES.get(json_status, 1),
+            ),
+            location_labels,
+        ]
 
         if interrupted:
             print("\nSearch interrupted!")
         elif unchecked:
             print("\nSearch incomplete - results may be incomplete.")
+        elif declined:
+            print("\nSearch stopped at your request - the variations were not checked.")
         else:
             print("\nSearch complete!")
 
@@ -1687,6 +3402,11 @@ def run_search():
                 "Because part of the search did not run, a matching observation may "
                 "still exist. Please try again."
             )
+        elif declined:
+            print(
+                "\nNo matches found. The variations were never checked, so a "
+                "matching observation may still exist."
+            )
         else:
             print("\nNo matches found. Consider these possibilities:")
             print("1. The observation may have more than one digit mistyped")
@@ -1712,36 +3432,58 @@ def run_search():
 
         print(f"\nTotal time: {timedelta(seconds=int(time.time() - start_time))}")
 
+    # Holds the outcome the summary described, so --json can report the same
+    # thing the human sees without a second pass over the results.
+    recorded = []
+
     # First, check if the original observation number is correct
     if verbose:
         print(
             f"Checking if original observation number {obs_number} matches {search_mode} '{search_term}'..."
         )
 
-    # Make a single API call to check the original number. A failure here does not
-    # stop the search, but it does mean the results are incomplete.
+    # Fetch the original number without criteria filters so a real observation is
+    # not mistaken for a missing one. Project membership, when relevant, is a
+    # separate question below.
     original_check_failed = False
     try:
-        original_check = fetch_observations([obs_number], project_id=project_id_param)
+        original_check = fetch_observations([obs_number])
     except ApiError as error:
         original_check = []
         original_check_failed = True
         print(f"Warning: could not check the original observation number - {error}")
 
-    # In project mode, if we get results passing project_id param, they are matches.
-    # In other modes, we need to check check_observation_* functions.
+    original_project_members = None
+    if original_check and search_mode == "project":
+        try:
+            original_project_members = fetch_project_membership(
+                [obs_number], project_id_param
+            )
+        except ApiError as error:
+            original_check_failed = True
+            print(
+                "Warning: could not check project membership for the original "
+                f"observation number - {error}"
+            )
 
     original_match = None
+    # What the supplied number actually references, whether or not it matched.
+    # Reported in its own JSON field so a caller can show it either way.
+    original_observation = original_check[0] if original_check else None
 
     if original_check:
         match_found = False
         obs = original_check[0]
 
         if search_mode == "project":
-            match_found = True
-            print(
-                f"✓ Good news! The original observation number {obs_number} is in project '{project_metadata.get('title')}'."
-            )
+            if (
+                original_project_members is not None
+                and str(obs.get("id")) in original_project_members
+            ):
+                match_found = True
+                print(
+                    f"✓ Good news! The original observation number {obs_number} is in project '{project_metadata.get('title')}'."
+                )
         elif search_mode == "genus" and check_observation_genus(
             obs, genus, target_taxon_id
         ):
@@ -1782,8 +3524,20 @@ def run_search():
             if not confirm("Continue searching for other potential matches? (y/n): "):
                 print("Exiting search.")
                 # The original observation is a real match and must be reported.
-                print_summary([original_match])
-                return API_FAILURE_EXIT_CODE if original_check_failed else 0
+                # Reaching here means the original lookup succeeded, so the only
+                # thing left unresolved is the variations the user declined.
+                print_summary(
+                    [original_match],
+                    original=original_observation,
+                    declined=True,
+                )
+                emit_recorded()
+                return 0
+        elif search_mode == "project" and original_project_members is None:
+            print(
+                f"The original observation #{obs.get('id', obs_number)} exists, "
+                "but its project membership could not be checked."
+            )
         elif search_mode == "taxon_id":
             print(
                 f"The original observation #{obs.get('id', obs_number)} exists but "
@@ -1854,7 +3608,9 @@ def run_search():
             print_summary(
                 [original_match] if original_match else [],
                 unchecked=1 if original_check_failed else 0,
+                original=original_observation,
             )
+            emit_recorded()
             return API_FAILURE_EXIT_CODE if original_check_failed else 0
         print("Error: No variations could be generated from the observation number.")
         sys.exit(1)
@@ -1881,8 +3637,13 @@ def run_search():
         f"This is a large search ({total_variations} variations). Continue? (y/n): "
     ):
         print("Exiting search.")
-        if original_match:
-            print_summary([original_match])
+        print_summary(
+            [original_match] if original_match else [],
+            unchecked=1 if original_check_failed else 0,
+            original=original_observation,
+            declined=True,
+        )
+        emit_recorded()
         return API_FAILURE_EXIT_CODE if original_check_failed else 0
 
     # Set up progress bar if requested
@@ -2005,7 +3766,13 @@ def run_search():
     if interrupted:
         print("\nSearch cancelled - reporting the matches found so far.")
 
-    print_summary(matches, interrupted=interrupted, unchecked=unchecked)
+    print_summary(
+        matches,
+        interrupted=interrupted,
+        unchecked=unchecked,
+        original=original_observation,
+    )
+    emit_recorded()
 
     if interrupted:
         return 130

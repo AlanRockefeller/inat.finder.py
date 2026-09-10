@@ -1,22 +1,35 @@
 import contextlib
 import io
 import itertools
+import json
 import math
+import os
+import subprocess
+import sys
+import threading
 import types
+import typing
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import Mock, patch
+from urllib.parse import parse_qs, urlparse
 
 import inat_finder
 from inat_finder import (
     ApiError,
+    AutoStage,
     CandidatePlan,
+    build_candidate_plan,
+    build_resume_token,
     count_digit_variations,
     generate_digit_additions,
     generate_digit_removals,
     generate_digit_transpositions,
     generate_digit_variations,
     parse_inat_url,
+    parse_resume_token,
     preprocess_argv_for_project_name,
+    restore_seen_ids,
     unique_by_integer_value,
 )
 
@@ -859,7 +872,7 @@ class TestInatFinderFunctions(unittest.TestCase):
             inat_finder.main()
 
         # Only the original-number lookup happened - no redundant second request.
-        fetch_observations.assert_called_once_with(["123456789"], project_id=None)
+        fetch_observations.assert_called_once_with(["123456789"])
         batch_check.assert_not_called()
         rendered_output = "\n".join(
             " ".join(str(arg) for arg in call.args) for call in output.call_args_list
@@ -1000,7 +1013,25 @@ class MainRunnerMixin:
                 inat_finder.main()
             except SystemExit as exit_error:
                 status = exit_error.code or 0
+        self.printed = printed
         return status, "\n".join(printed)
+
+    def run_main_json(self, argv, patches=None, expect_locations=True):
+        """Run main() with --json; return (status, parsed result, narration).
+
+        The JSON object is the last thing written, after every human line, so it
+        can be picked out of the captured output without the test having to model
+        the stdout/stderr split that the real command line uses.
+        """
+        argv = list(argv)
+        if "--json" not in argv:
+            argv.append("--json")
+        status, output = self.run_main(argv, patches, expect_locations)
+        payload = next(
+            (chunk for chunk in reversed(self.printed) if chunk.startswith("{")), None
+        )
+        self.assertIsNotNone(payload, f"no JSON object was printed:\n{output}")
+        return status, json.loads(payload), output
 
 
 class TestFailedBatchesAreNotFalseNegatives(MainRunnerMixin, unittest.TestCase):
@@ -1599,6 +1630,235 @@ class TestOriginalMatchIsPreserved(MainRunnerMixin, unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("Found 1 potential matches", output)
         self.assertEqual(output.count("Observation #123456789"), 1)
+
+
+class TestNormalModeOriginalProjectCheck(MainRunnerMixin, unittest.TestCase):
+    """The supplied ID is resolved before its project membership is evaluated."""
+
+    def _run_project(self, fetch):
+        return self.run_main_json(
+            [
+                "inat_finder.py",
+                "--project",
+                "fungi-map",
+                "123456789",
+                "--digits",
+                "0",
+                "--no-progress",
+                "--yes",
+            ],
+            {
+                "resolve_project_identifier": Mock(return_value=("42", PROJECT)),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+
+    def test_nonmember_is_fetched_unfiltered_and_reported_as_existing(self):
+        calls = []
+
+        def fetch(ids, project_id=None, batch_size=None):
+            calls.append((list(ids), project_id))
+            return [] if project_id else [_observation(123456789)]
+
+        status, result, output = self._run_project(fetch)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            calls,
+            [(["123456789"], None), (["123456789"], "42")],
+        )
+        self.assertIn("exists but does not match project 'fungi-map'", output)
+        self.assertNotIn("does not exist", output)
+        self.assertEqual(result["original"]["id"], 123456789)
+        self.assertEqual(result["matches"], [])
+
+    def test_member_is_recognized_by_the_separate_membership_lookup(self):
+        calls = []
+
+        def fetch(ids, project_id=None, batch_size=None):
+            calls.append((list(ids), project_id))
+            return [_observation(123456789)]
+
+        status, result, output = self._run_project(fetch)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            calls,
+            [(["123456789"], None), (["123456789"], "42")],
+        )
+        self.assertIn("is in project 'Fungi Map'", output)
+        self.assertEqual([match["id"] for match in result["matches"]], [123456789])
+
+    def test_nonexistent_observation_does_not_trigger_membership_lookup(self):
+        calls = []
+
+        def fetch(ids, project_id=None, batch_size=None):
+            calls.append((list(ids), project_id))
+            return []
+
+        status, result, _output = self._run_project(fetch)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(calls, [(["123456789"], None)])
+        self.assertIsNone(result["original"])
+
+    def test_membership_failure_preserves_observation_without_claiming_nonmembership(self):
+        def fetch(ids, project_id=None, batch_size=None):
+            if project_id:
+                raise ApiError("probe down")
+            return [_observation(123456789)]
+
+        status, result, output = self._run_project(fetch)
+
+        self.assertEqual(status, inat_finder.API_FAILURE_EXIT_CODE)
+        self.assertIn("exists, but its project membership could not be checked", output)
+        self.assertNotIn("does not match project", output)
+        self.assertEqual(result["original"]["id"], 123456789)
+
+
+class TestNormalModeJsonReportsTheSuppliedObservation(
+    MainRunnerMixin, unittest.TestCase
+):
+    """A normal-mode result says what the number points at, and when it stopped."""
+
+    def _patches(self, original=None, batch=None):
+        return {
+            "verify_user_exists": Mock(return_value=True),
+            "fetch_observations": Mock(
+                return_value=[original or _observation(123456789)]
+            ),
+            "batch_check_observations": Mock(
+                side_effect=batch
+                or (lambda *a, **k: inat_finder.BatchCheckResult([], 0, 0))
+            ),
+            "resolve_observation_locations": Mock(
+                return_value={123456789: "Pike Co. MS US"}
+            ),
+        }
+
+    def test_declining_to_keep_searching_is_not_an_exhausted_search(self):
+        """The variations were never checked, so nothing may claim completeness."""
+        with patch("builtins.input", return_value="n"):
+            status, result, output = self.run_main_json(
+                ["inat_finder.py", "--user", "observer", "123456789", "--no-progress"],
+                self._patches(),
+            )
+        self.assertEqual(status, 0)
+        self.assertIn("Exiting search.", output)
+        self.assertEqual(result["status"], "match_found")
+        self.assertEqual(result["stop_reason"], "declined")
+        self.assertFalse(result["complete"])
+        self.assertEqual([match["id"] for match in result["matches"]], [123456789])
+        self.assertEqual(result["original"]["id"], 123456789)
+
+    def test_declining_a_large_search_is_not_an_exhausted_search(self):
+        # Three digits off a nine-digit number is far past the large-search
+        # threshold, so the second prompt is the one that stops the run.
+        with patch("builtins.input", side_effect=["y", "n"]) as prompt:
+            status, result, output = self.run_main_json(
+                [
+                    "inat_finder.py",
+                    "--user",
+                    "observer",
+                    "123456789",
+                    "--no-progress",
+                    "--digits",
+                    "3",
+                ],
+                self._patches(),
+            )
+        self.assertEqual(status, 0)
+        # Prompts are written by input(), not print(), so the call log is what
+        # says which of the two exits this run took.
+        self.assertIn("This is a large search", prompt.call_args_list[1].args[0])
+        self.assertIn("Exiting search.", output)
+        self.assertEqual(result["status"], "match_found")
+        self.assertEqual(result["stop_reason"], "declined")
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["original"]["id"], 123456789)
+
+    def test_declining_a_large_search_without_a_match_still_reports_the_number(self):
+        """Nothing matched, but nothing was searched either - say both."""
+        with patch("builtins.input", return_value="n"):
+            status, result, output = self.run_main_json(
+                [
+                    "inat_finder.py",
+                    "--user",
+                    "observer",
+                    "123456789",
+                    "--no-progress",
+                    "--digits",
+                    "3",
+                ],
+                self._patches(
+                    original=_observation(123456789, login="someone_else")
+                ),
+            )
+        self.assertEqual(status, 0)
+        self.assertIn("Search stopped at your request", output)
+        self.assertNotIn("Search complete!", output)
+        # The stock "why did this find nothing" advice would be a non sequitur.
+        self.assertNotIn("The observation may have more than one digit mistyped", output)
+        self.assertEqual(result["status"], "no_match")
+        self.assertEqual(result["stop_reason"], "declined")
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["original"]["id"], 123456789)
+
+    def test_continuing_to_the_end_still_reports_an_exhausted_search(self):
+        status, result, _ = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--user",
+                "observer",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            self._patches(),
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(result["status"], "match_found")
+        self.assertEqual(result["stop_reason"], "exhausted")
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["original"]["id"], 123456789)
+
+    def test_a_nonmatching_supplied_number_is_still_reported(self):
+        """It matched nothing, but the caller still needs to see what it is."""
+        status, result, output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--user",
+                "observer",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            self._patches(original=_observation(123456789, login="someone_else")),
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("exists but does not match", output)
+        self.assertEqual(result["status"], "no_match")
+        self.assertEqual(result["matches"], [])
+        self.assertEqual(result["original"]["id"], 123456789)
+        self.assertEqual(result["original"]["user"], "someone_else")
+        self.assertEqual(result["original"]["location"], "Pike Co. MS US")
+
+    def test_a_missing_supplied_number_reports_no_original(self):
+        patches = self._patches()
+        patches["fetch_observations"] = Mock(return_value=[])
+        status, result, _ = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--user",
+                "observer",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            patches,
+        )
+        self.assertEqual(status, 0)
+        self.assertIsNone(result["original"])
 
 
 class TestLookupFailuresAreNotNotFound(MainRunnerMixin, unittest.TestCase):
@@ -2425,6 +2685,1443 @@ class TestExistingCriteriaStillWork(MainRunnerMixin, unittest.TestCase):
             "Looking for iNaturalist observations in project 'Fungi Map'", output
         )
         self.assertIn("2. The project might be incorrect", output)
+
+
+GENUS_TAXON = {"id": AMANITA_ID, "name": "Amanita", "rank": "genus"}
+FAMILY_TAXON = {"id": AMANITACEAE_ID, "name": "Amanitaceae", "rank": "family"}
+PROJECT = {"id": 42, "title": "Fungi Map", "slug": "fungi-map"}
+
+
+class AutoModeMixin(MainRunnerMixin):
+    """Drive --auto searches against a fake iNaturalist that returns fixed IDs."""
+
+    def fetcher(self, present, calls=None, project_members=None, fail=None):
+        """Build a fetch_observations stand-in.
+
+        ``present`` are the observation IDs that exist. ``project_members``, when
+        given, are the IDs a project-filtered request returns. ``fail`` is called
+        with (ids, project_id) and may raise to simulate a failing request.
+        """
+        calls = [] if calls is None else calls
+
+        def fetch(ids, project_id=None, batch_size=None):
+            ids = [str(value) for value in ids]
+            calls.append({"ids": ids, "project_id": project_id})
+            if fail is not None:
+                fail(ids, project_id)
+            if project_id is not None:
+                members = present if project_members is None else project_members
+                return [_observation(int(i)) for i in ids if int(i) in members]
+            return [_observation(int(i)) for i in ids if int(i) in present]
+
+        return fetch, calls
+
+    def requested_ids(self, calls, project_id=None):
+        """Every observation ID asked for, in order, optionally for one filter."""
+        return [
+            value
+            for call in calls
+            if project_id is None or call["project_id"] == project_id
+            for value in call["ids"]
+        ]
+
+
+class TestAutoModeLadder(AutoModeMixin, unittest.TestCase):
+    """--auto climbs from the number as given to progressively wider typos."""
+
+    def test_hit_in_stage_one_never_reaches_stage_two(self):
+        fetch, calls = self.fetcher({123456788})
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("Observation #123456788", output)
+        self.assertIn("Stage 1", output)
+        self.assertNotIn("Stage 2", output)
+        # Stage 0 is one ID; stage 1 for a nine-digit number is a single batch.
+        self.assertEqual(len(calls), 2)
+
+    def test_empty_stage_one_escalates_to_stage_two(self):
+        # 123456700 differs from 123456789 in two digits, so only stage 2 has it.
+        fetch, _calls = self.fetcher({123456700})
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("Stage 2", output)
+        self.assertIn("Observation #123456700", output)
+        self.assertIn("Found at stage 2", output)
+
+    def test_full_match_stops_before_the_next_batch(self):
+        """The point of intra-stage stopping: a hit must not cost the whole stage."""
+        stage_one = {int(value) for value in build_candidate_plan("123456789", 1)}
+        early = next(
+            value
+            for value in build_candidate_plan("123456789", 2)
+            if int(value) not in stage_one
+        )
+        # A second observation shares the batch and must still be reported.
+        companion = next(
+            value
+            for value in build_candidate_plan("123456789", 2)
+            if int(value) not in stage_one and value != early
+        )
+        fetch, calls = self.fetcher({int(early), int(companion)})
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        # Stage 0, all of stage 1, then exactly one batch of stage 2.
+        self.assertEqual(len(calls), 3)
+        self.assertLessEqual(len(calls[-1]["ids"]), inat_finder.BATCH_SIZE)
+        self.assertIn(f"Observation #{int(early)}", output)
+        self.assertIn(f"Observation #{int(companion)}", output)
+        self.assertIn("because a full match was found", output)
+
+    def test_no_observation_id_is_requested_twice(self):
+        fetch, calls = self.fetcher(set())
+        status, _output = self.run_main(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+                "--digits",
+                "2",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        asked = self.requested_ids(calls)
+        self.assertEqual(len(asked), len(set(asked)))
+
+    def test_stage_one_fail_fast_leaves_stage_two_totals_exact(self):
+        """The bug this accounting exists to avoid.
+
+        Stage sizes are ``plan.total - len(seen_ids)``, not
+        ``plan_k.total - plan_(k-1).total``. When stage 1 stops early after a run
+        of permanently failed batches, its unyielded candidates were never marked
+        as tried, so differencing the plan totals would declare a stage 2 far
+        smaller than the one that actually runs - corrupting both the progress
+        bar and the unchecked accounting that depends on that total.
+        """
+        number = "1870671"
+        plan_one = build_candidate_plan(number, 1)
+        plan_two = build_candidate_plan(number, 2)
+        seen = set()
+        stage_one = AutoStage(1, plan_one, seen)
+        self.assertEqual(stage_one.total, plan_one.total)
+
+        iterator = iter(stage_one)
+        for _ in range(inat_finder.BATCH_SIZE):
+            next(iterator)
+        self.assertEqual(len(seen), inat_finder.BATCH_SIZE)
+
+        stage_two = AutoStage(2, plan_two, seen)
+        self.assertEqual(stage_two.total, plan_two.total - len(seen))
+        self.assertGreater(stage_two.total, plan_two.total - plan_one.total)
+
+        # The candidates stage 1 never reached are picked up by stage 2, and the
+        # declared total is exactly what the stage goes on to yield.
+        leftovers = {int(value) for value in plan_one} - set(seen)
+        yielded = {int(value) for value in stage_two}
+        self.assertTrue(leftovers)
+        self.assertTrue(leftovers <= yielded)
+        self.assertEqual(stage_two.total, len(yielded))
+
+    def test_the_plans_nest_so_the_ladder_never_repeats_or_misses(self):
+        """The invariant the whole ladder rests on.
+
+        Stage k is plan k minus what earlier stages tried, which is only sound
+        because the plans nest as sets. Checked across shapes that stress the
+        deduplication: repeated digits (fewer swaps and removals survive), a
+        leading one followed by zeros, and lengths that switch the insertion and
+        removal classes on and off.
+        """
+        for number in ("123456789", "1234567", "1122334", "100000", "187067127"):
+            with self.subTest(number=number):
+                plans = [build_candidate_plan(number, k) for k in (1, 2, 3)]
+                sets = [{int(value) for value in plan} for plan in plans]
+                self.assertTrue(sets[0] <= sets[1] <= sets[2])
+                for plan, candidates in zip(plans, sets):
+                    self.assertEqual(plan.total, len(candidates))
+
+                seen = set()
+                for index, plan in zip((1, 2, 3), plans):
+                    stage = AutoStage(index, plan, seen)
+                    announced = stage.total
+                    yielded = list(stage)
+                    # What the stage announced is exactly what it goes on to
+                    # check - the progress bar and the unchecked accounting both
+                    # depend on that.
+                    self.assertEqual(announced, len(yielded))
+                    self.assertEqual(len(yielded), len(set(yielded)))
+                # Every candidate, once, and nothing beyond the widest plan.
+                self.assertEqual(seen, sets[2])
+
+    def test_stage_labels_describe_what_is_really_searched(self):
+        """Stage 1 is never just 'one digit off'."""
+        label = inat_finder.auto_stage_label(1, build_candidate_plan("123456789", 1))
+        self.assertIn("one substituted digit", label)
+        self.assertIn("adjacent swaps", label)
+        # Nine digits: removals apply, insertions do not.
+        self.assertIn("extra digits", label)
+        self.assertNotIn("missing", label)
+        short = inat_finder.auto_stage_label(1, build_candidate_plan("1234567", 1))
+        self.assertIn("missing or extra digits", short)
+        self.assertEqual(
+            inat_finder.auto_stage_label(2, build_candidate_plan("123456789", 2)),
+            "two substituted digits and extra digits",
+        )
+
+
+class TestAutoModeClues(AutoModeMixin, unittest.TestCase):
+    """Clues are clues: a wrong one is dropped, an outage is still an outage."""
+
+    def test_one_bad_clue_does_not_stop_the_good_one(self):
+        fetch, _calls = self.fetcher({123456788})
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanitaa",
+                "--user",
+                "observer",
+                "123456789",
+                "--no-progress",
+            ],
+            {
+                "find_taxon": Mock(return_value=None),
+                "verify_user_exists": Mock(return_value=True),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("Ignoring the genus clue", output)
+        self.assertIn("was unusable", output)
+        self.assertIn("Observation #123456788", output)
+
+    def test_api_failure_while_resolving_a_clue_is_not_a_bad_clue(self):
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+            ],
+            {"find_taxon": Mock(side_effect=ApiError("timeout"))},
+        )
+        self.assertEqual(status, inat_finder.API_FAILURE_EXIT_CODE)
+        self.assertIn("could not reach the iNaturalist API", output)
+        self.assertNotIn("Ignoring the genus clue", output)
+
+    def test_malformed_taxon_id_is_still_fatal_in_auto_mode(self):
+        status, output = self.run_main(
+            ["inat_finder.py", "--auto", "--taxon-id", "abc", "123456789"],
+            {"find_taxon_by_id": Mock(side_effect=AssertionError("must not look up"))},
+        )
+        self.assertEqual(status, 1)
+        self.assertIn("--taxon-id must be a positive", output)
+
+    def test_partial_match_does_not_end_the_ladder(self):
+        """A near miss is a reason to keep looking, not a reason to stop."""
+        # 123456788 matches the genus only; 123456700 matches genus and user, and
+        # lives two digits away, so it can only be found by widening to stage 2.
+        def fetch(ids, project_id=None, batch_size=None):
+            found = []
+            for value in ids:
+                if int(value) == 123456788:
+                    found.append(_observation(123456788, login="someone_else"))
+                elif int(value) == 123456700:
+                    found.append(_observation(123456700, login="observer"))
+            return found
+
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "--user",
+                "observer",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "verify_user_exists": Mock(return_value=True),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("Stage 2", output)
+        # Best-first: the full match outranks the partial one.
+        first = output.index("1. Observation #123456700")
+        second = output.index("2. Observation #123456788")
+        self.assertLess(first, second)
+        self.assertIn("[2 of 2: genus, user]", output)
+        self.assertIn("[1 of 2: genus]", output)
+
+    def test_no_clues_reports_the_number_without_enumerating(self):
+        fetch, calls = self.fetcher({123456789})
+        status, output = self.run_main(
+            ["inat_finder.py", "--auto", "123456789", "--no-progress"],
+            {"fetch_observations": Mock(side_effect=fetch)},
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("Observation #123456789 exists", output)
+        self.assertIn("No usable clue was supplied", output)
+
+
+class TestAutoModeProjects(AutoModeMixin, unittest.TestCase):
+    """Project membership is batch evidence, and may legitimately be unknown."""
+
+    def test_project_alone_still_filters_server_side(self):
+        fetch, calls = self.fetcher({123456788})
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--project",
+                "fungi-map",
+                "123456789",
+                "--no-progress",
+            ],
+            {
+                "resolve_project_identifier": Mock(return_value=("42", PROJECT)),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("Observation #123456788", output)
+        # One request per search batch, every one of them carrying the project
+        # filter. Stage 0 is deliberately unfiltered - it asks what the supplied
+        # number is, which a membership filter would refuse to answer.
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(calls[0]["project_id"])
+        self.assertEqual(calls[0]["ids"], ["123456789"])
+        self.assertTrue(all(call["project_id"] == "42" for call in calls[1:]))
+
+    def test_supplied_number_outside_the_project_is_not_called_nonexistent(self):
+        """A non-member observation exists; only its membership is a 'no'."""
+        fetch, calls = self.fetcher({123456789}, project_members=set())
+        status, result, output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--project",
+                "fungi-map",
+                "123456789",
+                "--no-progress",
+                "--digits",
+                "1",
+                "--yes",
+            ],
+            {
+                "resolve_project_identifier": Mock(return_value=("42", PROJECT)),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertNotIn("does not exist", output)
+        self.assertIn("Observation #123456789 exists", output)
+        self.assertIn("matched 0 of 1 clue(s)", output)
+        # The supplied number is reported for what it points at, not dropped.
+        self.assertIsNotNone(result["original"])
+        self.assertEqual(result["original"]["id"], 123456789)
+        self.assertEqual(result["matches"], [])
+        # Stage 0: one unfiltered lookup, then one membership probe.
+        self.assertIsNone(calls[0]["project_id"])
+        self.assertEqual(calls[1], {"ids": ["123456789"], "project_id": "42"})
+
+    def test_project_with_another_clue_probes_membership_separately(self):
+        fetch, calls = self.fetcher({123456788}, project_members={123456788})
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "--project",
+                "fungi-map",
+                "123456789",
+                "--no-progress",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "resolve_project_identifier": Mock(return_value=("42", PROJECT)),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("[2 of 2: genus, project]", output)
+        # The main request must not be filtered, or the genus clue could never
+        # match anything outside the project.
+        self.assertTrue(any(call["project_id"] is None for call in calls))
+        self.assertTrue(any(call["project_id"] == "42" for call in calls))
+
+    def test_failed_membership_probe_keeps_the_other_evidence(self):
+        def fail(ids, project_id):
+            if project_id is not None:
+                raise ApiError("probe down")
+
+        fetch, _calls = self.fetcher({123456788}, fail=fail)
+        status, result, output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "--project",
+                "fungi-map",
+                "123456789",
+                "--no-progress",
+                "--digits",
+                "1",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "resolve_project_identifier": Mock(return_value=("42", PROJECT)),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, inat_finder.API_FAILURE_EXIT_CODE)
+        self.assertEqual(result["status"], "incomplete")
+        # The genus evidence survives; only the project clue is unknown.
+        self.assertEqual(
+            [(m["id"], m["matched"], m["unknown"]) for m in result["matches"]],
+            [(123456788, ["genus"], ["project"])],
+        )
+        # An incomplete search must never hand out a cursor that would skip the gap.
+        self.assertIsNone(result["resume"])
+        self.assertIn("unknown", output)
+
+    def test_unresolvable_project_is_a_clue_in_auto_mode_only(self):
+        fetch, _calls = self.fetcher({123456788})
+        patches = {
+            "find_taxon": Mock(return_value=GENUS_TAXON),
+            "search_projects_by_query": Mock(return_value=[]),
+            "api_get_json": Mock(return_value=None),
+            "fetch_observations": Mock(side_effect=fetch),
+        }
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "--project",
+                "no such project",
+                "123456789",
+                "--no-progress",
+            ],
+            patches,
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("Ignoring the project clue", output)
+        self.assertIn("Observation #123456788", output)
+
+        # Without --auto the same project is still a fatal input error.
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--project",
+                "no such project",
+                "123456789",
+                "--no-progress",
+            ],
+            {
+                "search_projects_by_query": Mock(return_value=[]),
+                "api_get_json": Mock(return_value=None),
+            },
+        )
+        self.assertEqual(status, 1)
+
+
+class TestAutoModeResume(AutoModeMixin, unittest.TestCase):
+    """A stop must be resumable, because the web front end stops all the time."""
+
+    def test_token_round_trip(self):
+        self.assertEqual(
+            parse_resume_token(build_resume_token(2, 400, "abc12345")),
+            (2, 400, "abc12345"),
+        )
+
+    def test_malformed_tokens_are_rejected(self):
+        for value in ("", "2:400", "v1:2:400", "v9:2:400:abc", "vx:2:400:abc", 7):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_resume_token(value)
+
+    def test_restore_replays_exactly_what_the_original_run_had_tried(self):
+        number = "123456789"
+        plan_one = build_candidate_plan(number, 1)
+        plan_two = build_candidate_plan(number, 2)
+        seen = set()
+        stage_one = AutoStage(1, plan_one, seen)
+        list(stage_one)
+        stage_two = AutoStage(2, plan_two, seen)
+        iterator = iter(stage_two)
+        for _ in range(inat_finder.BATCH_SIZE):
+            next(iterator)
+        self.assertEqual(
+            restore_seen_ids(number, 2, stage_two.plan_position), set(seen)
+        )
+
+    def test_resume_continues_without_repeating_a_single_id(self):
+        stage_one = {int(value) for value in build_candidate_plan("123456789", 1)}
+        early = next(
+            value
+            for value in build_candidate_plan("123456789", 2)
+            if int(value) not in stage_one
+        )
+        fetch, first_calls = self.fetcher({int(early)})
+        status, first_result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+                "--yes",
+                "--digits",
+                "2",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(first_result["status"], "match_found")
+        token = first_result["resume"]["token"]
+        self.assertEqual(first_result["resume"]["stage"], 2)
+
+        fetch_again, second_calls = self.fetcher(set())
+        status, second_result, output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+                "--yes",
+                "--digits",
+                "2",
+                "--auto-resume",
+                token,
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch_again),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("Resuming at stage 2", output)
+        self.assertEqual(second_result["status"], "no_match")
+        # Stage 0 and stage 1 are replayed offline, not re-requested.
+        self.assertNotIn("Stage 1", output)
+        first_ids = set(self.requested_ids(first_calls))
+        second_ids = set(self.requested_ids(second_calls))
+        self.assertTrue(second_ids)
+        self.assertEqual(first_ids & second_ids, set())
+
+    def test_a_cursor_outside_the_ladder_is_refused(self):
+        """A fingerprint proves provenance, not that the coordinates can exist.
+
+        The stage and offset are plain text in the token, so an edited or stale
+        cursor could otherwise point at a stage the ladder does not have - which
+        would quietly search nothing and report a clean "no match".
+        """
+        number = "123456789"
+        fingerprint = inat_finder.search_fingerprint(
+            number, [inat_finder._user_criterion("observer")], 2
+        )
+        oversized = build_candidate_plan(number, 2).total + 1
+        cases = {
+            "stage above the cap": build_resume_token(3, 0, fingerprint),
+            "stage zero": build_resume_token(0, 0, fingerprint),
+            "offset past the plan": build_resume_token(2, oversized, fingerprint),
+        }
+        for label, token in cases.items():
+            with self.subTest(case=label):
+                fetch, calls = self.fetcher(set())
+                status, result, _output = self.run_main_json(
+                    [
+                        "inat_finder.py",
+                        "--auto",
+                        "--user",
+                        "observer",
+                        number,
+                        "--no-progress",
+                        "--digits",
+                        "2",
+                        "--auto-resume",
+                        token,
+                    ],
+                    {
+                        "verify_user_exists": Mock(return_value=True),
+                        "fetch_observations": Mock(side_effect=fetch),
+                    },
+                )
+                self.assertEqual(status, 1)
+                self.assertEqual(result["status"], "error")
+                self.assertEqual(result["stop_reason"], "bad_resume")
+                self.assertFalse(result["complete"])
+                self.assertEqual(calls, [])
+
+    def test_a_token_from_another_search_is_refused(self):
+        fetch, _calls = self.fetcher(set())
+        good = inat_finder.search_fingerprint("123456789", [], 2)
+        status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+                "--auto-resume",
+                build_resume_token(2, 0, good),
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("different search", result["message"])
+
+    def test_auto_resume_without_auto_is_a_usage_error(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            status, _output = self.run_main(
+                [
+                    "inat_finder.py",
+                    "--genus",
+                    "Amanita",
+                    "123456789",
+                    "--auto-resume",
+                    "v1:2:0:abc12345",
+                ]
+            )
+        self.assertEqual(status, 2)
+        self.assertIn("only meaningful with --auto", stderr.getvalue())
+
+    def test_no_cursor_is_issued_when_anything_went_unchecked(self):
+        """Failure then match: report the match, but never a resume cursor.
+
+        The failed batch's IDs are already marked as tried, so a cursor would skip
+        them for good and turn a gap into a confident 'no match' later on.
+        """
+        # A seven-digit number gives stage 1 many batches, so one can fail
+        # permanently while a later one still carries the match.
+        candidates = [str(value) for value in build_candidate_plan("1234567", 1)]
+        doomed = set(candidates[: inat_finder.BATCH_SIZE])
+        match_id = int(candidates[inat_finder.BATCH_SIZE * 2 + 5])
+
+        def fail(ids, project_id):
+            if set(ids) & doomed:
+                raise ApiError("offline")
+
+        fetch, _calls = self.fetcher({match_id}, fail=fail)
+        status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "1234567",
+                "--no-progress",
+                "--digits",
+                "1",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, inat_finder.API_FAILURE_EXIT_CODE)
+        self.assertEqual(result["status"], "incomplete")
+        self.assertEqual([m["id"] for m in result["matches"]], [match_id])
+        self.assertIsNone(result["resume"])
+        self.assertGreaterEqual(result["unchecked"], inat_finder.BATCH_SIZE)
+
+
+class TestAutoModeCompleteness(AutoModeMixin, unittest.TestCase):
+    """Anything that leaves candidates unsearched must say it is not complete."""
+
+    def test_stage_zero_membership_failure_makes_the_search_incomplete(self):
+        """Stage 0 is never re-run on a resume, so its gaps cannot be deferred.
+
+        Without this the original observation's project membership could go
+        unanswered, the run could still pause at a later stage and hand out a
+        cursor, and the resumed run would skip stage 0 entirely - losing the
+        question for good.
+        """
+        def fail(ids, project_id):
+            if project_id is not None:
+                raise ApiError("probe down")
+
+        fetch, _calls = self.fetcher({123456789}, fail=fail)
+        status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "--project",
+                "fungi-map",
+                "123456789",
+                "--no-progress",
+                "--digits",
+                "1",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "resolve_project_identifier": Mock(return_value=("42", PROJECT)),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, inat_finder.API_FAILURE_EXIT_CODE)
+        self.assertEqual(result["status"], "incomplete")
+        self.assertFalse(result["complete"])
+        self.assertIsNone(result["resume"])
+        # The genus evidence for the original observation is still reported.
+        self.assertEqual(
+            [(m["id"], m["matched"], m["unknown"]) for m in result["matches"]],
+            [(123456789, ["genus"], ["project"])],
+        )
+
+    def test_needs_confirmation_is_not_complete(self):
+        fetch, _calls = self.fetcher(set())
+        _status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(result["status"], "needs_confirmation")
+        self.assertFalse(result["complete"])
+
+    def test_completeness_is_stated_for_every_way_a_search_can_end(self):
+        complete = inat_finder.outcome_is_complete
+        # Ran to a conclusion.
+        self.assertTrue(complete("match_found", "full_match"))
+        self.assertTrue(complete("no_match", "exhausted"))
+        self.assertTrue(complete("no_match", "no_clues"))
+        # Stopped with candidates deliberately left unsearched.
+        self.assertFalse(complete("match_found", "declined"))
+        self.assertFalse(complete("no_match", "declined"))
+        self.assertFalse(complete("error", "too_large"))
+        self.assertFalse(complete("needs_confirmation", "large_stage"))
+        # Did not finish at all.
+        self.assertFalse(complete("incomplete", "failures"))
+        self.assertFalse(complete("cancelled", "interrupted"))
+        self.assertFalse(complete("error", "usage"))
+
+    def test_declining_a_large_stage_stops_and_offers_a_resume(self):
+        fetch, _calls = self.fetcher(set())
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+                "stdin_is_interactive": Mock(return_value=True),
+                "get_user_confirmation": Mock(return_value=False),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("Stopped before the larger stage", output)
+        self.assertIn("--auto-resume", output)
+
+    def test_an_unsearchably_large_stage_is_an_error_not_a_no_match(self):
+        """The stage was never searched, so 'nothing there' is not established."""
+        fetch, _calls = self.fetcher(set())
+        status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+                "--yes",
+                "--digits",
+                "9",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+                "MAX_SEARCH_CANDIDATES": 200,
+            },
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["stop_reason"], "too_large")
+        self.assertFalse(result["complete"])
+
+    def test_a_finished_search_is_complete(self):
+        fetch, _calls = self.fetcher(set())
+        _status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+                "--digits",
+                "1",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(result["status"], "no_match")
+        self.assertTrue(result["complete"])
+
+    def test_interrupt_reports_what_the_stage_had_really_checked(self):
+        """A cancelled search still has honest progress numbers.
+
+        The counts come from the batch loop's own state rather than being reset
+        to zero, so a page can say "searched 400 of 3,093" instead of "0".
+        """
+        state = {"batches": 0}
+        completed = 2
+
+        def fetch(ids, project_id=None, batch_size=None):
+            if len(list(ids)) == 1:
+                return []
+            state["batches"] += 1
+            if state["batches"] > completed:
+                raise KeyboardInterrupt
+            return []
+
+        status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "1234567",
+                "--no-progress",
+                "--digits",
+                "1",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 130)
+        self.assertEqual(result["status"], "cancelled")
+        stage = result["stages"][-1]
+        self.assertEqual(stage["stage"], 1)
+        self.assertEqual(stage["attempted"], completed * inat_finder.BATCH_SIZE)
+        self.assertEqual(stage["total"], build_candidate_plan("1234567", 1).total)
+
+    def test_interrupt_keeps_matches_found_earlier_in_the_same_stage(self):
+        """Ctrl+C reports what was found so far, including the running stage."""
+        state = {"batches": 0}
+
+        def fetch(ids, project_id=None, batch_size=None):
+            ids = [str(value) for value in ids]
+            if len(ids) == 1:
+                return []
+            state["batches"] += 1
+            if state["batches"] == 1:
+                # Matches the genus but not the user, so the ladder keeps going
+                # instead of stopping on a full match before the interrupt lands.
+                return [_observation(int(ids[0]), login="someone_else")]
+            raise KeyboardInterrupt
+
+        expected = int(next(iter(build_candidate_plan("1234567", 1))))
+        status, result, output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "--user",
+                "observer",
+                "1234567",
+                "--no-progress",
+                "--digits",
+                "1",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "verify_user_exists": Mock(return_value=True),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 130)
+        self.assertEqual(result["status"], "cancelled")
+        self.assertFalse(result["complete"])
+        self.assertEqual([m["id"] for m in result["matches"]], [expected])
+        self.assertIn("Search interrupted", output)
+
+
+class TestAutoModeConfirmation(AutoModeMixin, unittest.TestCase):
+    """A stage too big to run unattended asks, or reports that it needs to."""
+
+    def test_non_interactive_returns_needs_confirmation(self):
+        fetch, _calls = self.fetcher(set())
+        status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+                "get_user_confirmation": Mock(
+                    side_effect=AssertionError("must not prompt")
+                ),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(result["status"], "needs_confirmation")
+        self.assertEqual(result["stage"], 3)
+        self.assertGreater(result["estimated_candidates"], 5000)
+        self.assertEqual(result["resume"]["stage"], 3)
+        self.assertEqual(result["resume"]["offset"], 0)
+
+    def test_yes_proceeds_through_the_large_stage(self):
+        fetch, calls = self.fetcher(set())
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+                "--yes",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+                "get_user_confirmation": Mock(
+                    side_effect=AssertionError("--yes must not prompt")
+                ),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertIn("Stage 3", output)
+        self.assertGreater(len(calls), 100)
+
+    def test_a_terminal_still_gets_a_prompt(self):
+        fetch, _calls = self.fetcher(set())
+        confirm = Mock(return_value=False)
+        status, output = self.run_main(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+                "stdin_is_interactive": Mock(return_value=True),
+                "get_user_confirmation": confirm,
+            },
+        )
+        self.assertEqual(status, 0)
+        confirm.assert_called_once()
+        self.assertIn("large stage", confirm.call_args.args[0])
+        self.assertIn("--auto-resume", output)
+
+
+class TestAutoModeJson(AutoModeMixin, unittest.TestCase):
+    """--json is an interface: statuses and exit codes are part of the contract."""
+
+    def test_match_found_shape(self):
+        fetch, _calls = self.fetcher({123456788})
+        status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(result["status"], "match_found")
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["version"], inat_finder.JSON_RESULT_VERSION)
+        self.assertEqual(result["clues"], ["genus"])
+        self.assertEqual(result["stop_reason"], "full_match")
+        match = result["matches"][0]
+        self.assertEqual(match["id"], 123456788)
+        self.assertEqual(match["score"], 1)
+        self.assertEqual(match["matched"], ["genus"])
+        self.assertEqual(match["stage"], 1)
+        self.assertEqual(
+            match["url"], "https://www.inaturalist.org/observations/123456788"
+        )
+        self.assertEqual([entry["stage"] for entry in result["stages"]], [0, 1])
+
+    def test_every_status_maps_to_its_documented_exit_code(self):
+        for status_name, expected in inat_finder.STATUS_EXIT_CODES.items():
+            with self.subTest(status=status_name):
+                outcome = inat_finder.SearchOutcome(status=status_name)
+                self.assertEqual(inat_finder._emit(None, outcome, {}), expected)
+
+    def test_bad_input_still_produces_a_parsable_result(self):
+        """Even the exit paths that predate --json must not print half an object."""
+        status, result, _output = self.run_main_json(
+            ["inat_finder.py", "--auto", "--genus", "Amanita", "not-a-number"],
+            {"find_taxon": Mock(return_value=GENUS_TAXON)},
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(result["status"], "error")
+
+    def test_json_works_for_a_normal_search_too(self):
+        fetch, _calls = self.fetcher({123456788})
+        status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(result["status"], "match_found")
+        self.assertEqual([m["id"] for m in result["matches"]], [123456788])
+        # A normal search has no ladder, so it has no stage and nothing to resume.
+        self.assertIsNone(result["stage"])
+        self.assertIsNone(result["resume"])
+
+    def test_interrupt_is_reported_as_cancelled(self):
+        def fetch(ids, project_id=None, batch_size=None):
+            if len(ids) > 1:
+                raise KeyboardInterrupt
+            return []
+
+        status, result, _output = self.run_main_json(
+            [
+                "inat_finder.py",
+                "--auto",
+                "--genus",
+                "Amanita",
+                "123456789",
+                "--no-progress",
+            ],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+        self.assertEqual(status, 130)
+        self.assertEqual(result["status"], "cancelled")
+        self.assertFalse(result["complete"])
+
+
+class TestAutoModeDoesNotDisturbNormalSearches(MainRunnerMixin, unittest.TestCase):
+    """The old command line keeps its behaviour, including its exit codes."""
+
+    def test_digits_still_defaults_to_one_without_auto(self):
+        with patch.object(
+            inat_finder.sys, "argv", ["inat_finder.py", "--genus", "A", "123456789"]
+        ):
+            self.assertEqual(inat_finder.parse_arguments().digits, 1)
+
+    def test_digits_defaults_to_the_ladder_cap_with_auto(self):
+        with patch.object(
+            inat_finder.sys,
+            "argv",
+            ["inat_finder.py", "--auto", "--genus", "A", "123456789"],
+        ):
+            args = inat_finder.parse_arguments()
+        self.assertEqual(args.digits, inat_finder.AUTO_DEFAULT_MAX_DIGITS)
+
+    def test_explicit_digits_still_wins_in_both_modes(self):
+        for argv in (
+            ["inat_finder.py", "--genus", "A", "123456789", "--digits", "2"],
+            ["inat_finder.py", "--auto", "--genus", "A", "123456789", "--digits", "2"],
+        ):
+            with self.subTest(argv=argv), patch.object(inat_finder.sys, "argv", argv):
+                self.assertEqual(inat_finder.parse_arguments().digits, 2)
+
+    def test_missing_criterion_is_still_a_usage_error(self):
+        stderr = io.StringIO()
+        with (
+            contextlib.redirect_stderr(stderr),
+            patch.object(inat_finder.sys, "argv", ["inat_finder.py", "123456789"]),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            inat_finder.parse_arguments()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("is required", stderr.getvalue())
+
+    def test_conflicting_criteria_are_still_a_usage_error(self):
+        stderr = io.StringIO()
+        argv = ["inat_finder.py", "--genus", "Amanita", "--user", "x", "123456789"]
+        with (
+            contextlib.redirect_stderr(stderr),
+            patch.object(inat_finder.sys, "argv", argv),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            inat_finder.parse_arguments()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("not allowed with argument", stderr.getvalue())
+
+    def test_auto_accepts_every_criterion_at_once(self):
+        argv = [
+            "inat_finder.py",
+            "--auto",
+            "--genus",
+            "Amanita",
+            "--family",
+            "Amanitaceae",
+            "--user",
+            "observer",
+            "123456789",
+        ]
+        with patch.object(inat_finder.sys, "argv", argv):
+            args = inat_finder.parse_arguments()
+        self.assertEqual(args.genus, "Amanita")
+        self.assertEqual(args.family, "Amanitaceae")
+        self.assertEqual(args.user, "observer")
+
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+# Bootstrap for the subprocess tests: point the script at a local stub and take
+# the rate limiter out of the way, then hand over to main() exactly as the real
+# console entry point does.
+SUBPROCESS_BOOTSTRAP = (
+    "import sys; sys.path.insert(0, {repo!r}); import inat_finder; "
+    "inat_finder.API_BASE_URL = {base!r}; "
+    "inat_finder.RATE_LIMITER.min_interval = 0; "
+    "inat_finder.main()"
+)
+
+
+class _StubHandler(BaseHTTPRequestHandler):
+    """Answers just enough of the iNaturalist API to drive a real search."""
+
+    # Shared by every request the stub server handles; set once per test class.
+    present: typing.ClassVar[set] = set()
+
+    def log_message(self, *args):
+        """Silence BaseHTTPRequestHandler's default logging to stderr."""
+
+    def _send(self, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        if parsed.path.endswith("/taxa/autocomplete") or parsed.path.endswith("/taxa"):
+            self._send({"results": [dict(GENUS_TAXON)]})
+        elif parsed.path.endswith("/observations"):
+            ids = [
+                value
+                for chunk in query.get("id", [])
+                for value in chunk.split(",")
+                if value
+            ]
+            self._send(
+                {
+                    "results": [
+                        _observation(int(value))
+                        for value in ids
+                        if int(value) in type(self).present
+                    ]
+                }
+            )
+        else:
+            self._send({"results": []})
+
+
+class TestJsonSubprocessContract(unittest.TestCase):
+    """stdout is exactly one JSON document for every invocation carrying --json.
+
+    These run the real interpreter rather than patching print(), because the
+    in-process helpers cannot model what a web front end actually reads. The
+    failure this class exists to prevent is an argparse error - a missing
+    observation number, an unknown option, two conflicting criteria - exiting
+    before any JSON is written, which leaves the caller a bare status 2 and
+    nothing to show a user.
+    """
+
+    server = None
+    thread = None
+
+    @classmethod
+    def setUpClass(cls):
+        _StubHandler.present = {123456788}
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), _StubHandler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        host, port = cls.server.server_address[:2]
+        cls.base_url = f"http://{host}:{port}/v1"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+
+    def invoke(self, *args, base_url=None):
+        """Run the script for real; return (exit status, parsed stdout, stderr)."""
+        bootstrap = SUBPROCESS_BOOTSTRAP.format(
+            repo=REPO_ROOT, base=base_url or self.base_url
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", bootstrap, *args],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=REPO_ROOT,
+            check=False,
+        )
+        # The whole of stdout must parse. Anything else - a stray print, a
+        # half-written object, an empty stream - fails here.
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError as error:
+            self.fail(
+                f"stdout was not one JSON document ({error})\n"
+                f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+            )
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload["version"], inat_finder.JSON_RESULT_VERSION)
+        self.assertEqual(payload["exit_code"], proc.returncode)
+        return proc.returncode, payload, proc.stderr
+
+    def test_a_real_match_round_trips(self):
+        status, payload, stderr = self.invoke(
+            "--json", "--auto", "--genus", "Amanita", "123456789", "--no-progress"
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(payload["status"], "match_found")
+        self.assertTrue(payload["complete"])
+        self.assertEqual([m["id"] for m in payload["matches"]], [123456788])
+        # Narration goes to stderr, so stdout stays parsable.
+        self.assertIn("Verifying genus", stderr)
+
+    def test_needs_confirmation_round_trips(self):
+        status, payload, _stderr = self.invoke(
+            "--json", "--auto", "--genus", "Amanita", "999999999", "--no-progress"
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(payload["status"], "needs_confirmation")
+        self.assertFalse(payload["complete"])
+        self.assertEqual(payload["stage"], 3)
+        self.assertGreater(payload["estimated_candidates"], 5000)
+        self.assertEqual(payload["resume"]["offset"], 0)
+
+    def test_missing_observation_number_is_json_not_a_bare_usage_error(self):
+        status, payload, stderr = self.invoke("--json", "--genus", "Amanita")
+        self.assertEqual(status, 2)
+        self.assertEqual(payload["status"], "error")
+        self.assertEqual(payload["stop_reason"], "usage")
+        self.assertFalse(payload["complete"])
+        self.assertIn("observation_number", payload["message"])
+        # The human-facing usage message is still on stderr, unchanged.
+        self.assertIn("usage:", stderr)
+
+    def test_conflicting_criteria_are_json(self):
+        status, payload, _stderr = self.invoke(
+            "--json", "--genus", "Amanita", "--user", "observer", "123456789"
+        )
+        self.assertEqual(status, 2)
+        self.assertEqual(payload["status"], "error")
+        self.assertEqual(payload["stop_reason"], "usage")
+        self.assertIn("not allowed with argument", payload["message"])
+
+    def test_missing_criteria_are_json(self):
+        status, payload, _stderr = self.invoke("--json", "123456789")
+        self.assertEqual(status, 2)
+        self.assertEqual(payload["stop_reason"], "usage")
+        self.assertIn("is required", payload["message"])
+
+    def test_unknown_option_is_json(self):
+        status, payload, _stderr = self.invoke(
+            "--json", "--genus", "Amanita", "123456789", "--nonsense"
+        )
+        self.assertEqual(status, 2)
+        self.assertEqual(payload["stop_reason"], "usage")
+
+    def test_auto_resume_without_auto_is_json(self):
+        status, payload, _stderr = self.invoke(
+            "--json",
+            "--genus",
+            "Amanita",
+            "123456789",
+            "--auto-resume",
+            "v1:2:0:abc12345",
+        )
+        self.assertEqual(status, 2)
+        self.assertEqual(payload["stop_reason"], "usage")
+        self.assertIn("only meaningful with --auto", payload["message"])
+
+    def test_malformed_taxon_id_is_json(self):
+        status, payload, _stderr = self.invoke(
+            "--json", "--auto", "--taxon-id", "abc", "123456789"
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(payload["status"], "error")
+        self.assertEqual(payload["stop_reason"], "bad_input")
+        self.assertFalse(payload["complete"])
+        self.assertIn("--taxon-id", payload["message"])
+
+    def test_normal_mode_clue_failure_explains_itself_in_json(self):
+        """--json is documented for both modes, so both must say *why*.
+
+        Without --auto an unknown genus is fatal, and the explanation used to
+        exist only on stderr - leaving a page with an error it could not show.
+        """
+        status, payload, stderr = self.invoke(
+            "--json", "--genus", "DefinitelyNotAGenus", "123456789", "--no-progress"
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(payload["status"], "error")
+        self.assertEqual(payload["stop_reason"], "bad_input")
+        self.assertFalse(payload["complete"])
+        self.assertIn("DefinitelyNotAGenus", payload["message"])
+        self.assertIn("not found", payload["message"])
+        self.assertEqual(
+            [clue["kind"] for clue in payload["unusable_clues"]], ["genus"]
+        )
+        self.assertIn("not found in iNaturalist taxonomy", stderr)
+
+    def test_normal_mode_unknown_user_explains_itself_in_json(self):
+        status, payload, _stderr = self.invoke(
+            "--json", "--user", "nobody_at_all", "123456789", "--no-progress"
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(payload["stop_reason"], "bad_input")
+        self.assertIn("nobody_at_all", payload["message"])
+
+    def test_a_non_numeric_observation_number_is_json(self):
+        status, payload, _stderr = self.invoke(
+            "--json", "--auto", "--genus", "Amanita", "not-a-number"
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(payload["stop_reason"], "bad_input")
+        self.assertIn("only digits", payload["message"])
+
+    def test_invalid_resume_token_is_json(self):
+        status, payload, _stderr = self.invoke(
+            "--json", "--auto", "--genus", "Amanita", "123456789", "--auto-resume", "junk"
+        )
+        self.assertEqual(status, 1)
+        self.assertEqual(payload["status"], "error")
+        self.assertEqual(payload["stop_reason"], "bad_resume")
+
+    def test_unreachable_api_is_json_and_not_a_clean_no_match(self):
+        # Port 1 refuses connections, so this is an outage rather than a result.
+        status, payload, _stderr = self.invoke(
+            "--json",
+            "--auto",
+            "--genus",
+            "Amanita",
+            "123456789",
+            "--no-progress",
+            base_url="http://127.0.0.1:1/v1",
+        )
+        self.assertEqual(status, inat_finder.API_FAILURE_EXIT_CODE)
+        self.assertEqual(payload["status"], "incomplete")
+        self.assertFalse(payload["complete"])
+        self.assertEqual(payload["matches"], [])
+
+    def test_json_abbreviation_still_gets_a_json_usage_error(self):
+        """argparse accepts --js, so the pre-parse scan must accept it too."""
+        status, payload, _stderr = self.invoke("--js", "--genus", "Amanita")
+        self.assertEqual(status, 2)
+        self.assertEqual(payload["stop_reason"], "usage")
 
 
 if __name__ == "__main__":

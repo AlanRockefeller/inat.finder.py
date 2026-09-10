@@ -2,6 +2,34 @@
 
 All notable changes to the inat.finder.py project will be documented in this file.
 
+## [1.8.0] - 2026-09-10
+
+### Added
+
+- `--auto` works through the common failure modes on its own, so a foray collection whose number does not resolve no longer needs a dozen hand-written re-runs. Thanks to Stephen Russell for the suggestion.
+- In auto mode the search criteria stop being mutually exclusive and stop being required: pass whichever of `--genus`, `--family`, `--taxon-id`, `--user` and `--project` you actually know, in any combination, or none at all. With no clues it reports what the number you gave really points at.
+- A clue that iNaturalist cannot resolve no longer ends an auto search. An unknown genus, family, taxon, user or project is reported, dropped, and left out of scoring while the other clues carry on - on a foray the mistaken element is as often the genus as the number. Malformed input is still an error, and an unreachable API is still an unreachable API.
+- Matches are ranked by how many clues they satisfied rather than filtered by all of them, and each one says which clues matched: `[2 of 3: genus, user; project: unknown]`. When nothing matched everything, the tool says so, because that usually means one of the supplied elements is the wrong one.
+- The search now stops the moment a batch contains a full match, part-way through a stage instead of at the end of it. A hit in the first 200 candidates of the widest stage costs one request instead of seven minutes.
+- Every voluntary stop prints an `--auto-resume` token that continues from exactly where the run left off, replaying the already-tried candidates offline with no API calls. The token is bound to the observation number, the clues and the `--digits` cap, so a cursor can never be replayed against a search it did not come from.
+- `--json` prints one machine-readable result object on stdout with all human narration on stderr, in both auto and normal mode. Its `status` field (`match_found`, `no_match`, `needs_confirmation`, `incomplete`, `cancelled`, `error`) pairs with the documented exit codes, so a script or a web page never has to parse English. Command-line syntax errors are covered too: a missing observation number or two conflicting criteria produce a JSON object explaining the problem rather than a bare status 2.
+- The JSON result carries `exit_code`, so a caller holding only stdout does not have to infer the process status, and `complete`, which is true only when the search really ran to a conclusion - a paused, declined or over-sized stage is explicitly not complete even though it is not a failure.
+- A stage too large to run unattended reports `needs_confirmation` with a candidate count and time estimate instead of prompting, whenever stdin is not a terminal. A front end can show "about 59,000 more possibilities - continue?" and re-run with `--yes` and the resume token.
+- With `--auto`, `--digits N` caps how wide the ladder may go and defaults to 3. Without it, `--digits` means exactly what it always did and still defaults to 1.
+
+### Fixed
+
+- A search that could not check every candidate is never handed a resume cursor, and never reports `needs_confirmation` or "no match" over the gap. The failed batch's IDs are already marked as tried, so a cursor would skip them for good; such a run says it is incomplete and exits `2`, as it always has.
+- When `--project` is combined with another clue, a failed project-membership request no longer discards the genus, user and taxon evidence for the same batch. Those matches are kept with project membership marked unknown, the search is reported incomplete, and it exits `2`. This includes the check of the number as supplied, which a resumed search never repeats and whose unanswered questions would otherwise be skipped for good.
+- A resume token is now checked for a stage and offset that can actually exist, not only for a valid signature. An edited or stale cursor pointing past the end of the ladder is refused instead of searching nothing and reporting a clean "no match".
+- Ctrl+C keeps the matches already found in the stage that was running, rather than only those from stages that had finished.
+- A stage too large to search is reported as an error rather than as "no matches found", since that stage was never searched.
+- Under `--json`, a genus, family, taxon, user or project that does not exist in a normal (non-`--auto`) search now reports _why_ in the result object, instead of leaving the explanation on stderr and handing the caller an error with no message.
+- A cancelled search reports the candidates its stage had really checked, rather than zero, so a progress display stays honest after Ctrl+C.
+- With `--auto --project` and no other clue, the number as supplied is now looked up unfiltered and its project membership asked separately. An observation that exists but is not a member was previously reported as not existing at all, with nothing in the JSON `original` field to show what the number really pointed at.
+- A normal (non-`--auto`) search that stops because you declined to keep looking no longer reports itself as a completed, exhausted search. The variations were never checked, so the result says `declined` and `complete` is false - in both the JSON and the printed summary, which no longer says "Search complete!" or offers advice about why nothing was found.
+- A normal search's JSON result now fills in `original` with the observation the supplied number actually points at, matching or not, instead of always `null`. A front end can show what the number references even when it belongs to a different taxon or observer.
+
 ## [1.7.5] - 2026-09-01
 
 ### Added
