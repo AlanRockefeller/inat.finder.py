@@ -3442,18 +3442,29 @@ def execute_search(args, sink=None):
             f"Checking if original observation number {obs_number} matches {search_mode} '{search_term}'..."
         )
 
-    # Make a single API call to check the original number. A failure here does not
-    # stop the search, but it does mean the results are incomplete.
+    # Fetch the original number without criteria filters so a real observation is
+    # not mistaken for a missing one. Project membership, when relevant, is a
+    # separate question below.
     original_check_failed = False
     try:
-        original_check = fetch_observations([obs_number], project_id=project_id_param)
+        original_check = fetch_observations([obs_number])
     except ApiError as error:
         original_check = []
         original_check_failed = True
         print(f"Warning: could not check the original observation number - {error}")
 
-    # In project mode, if we get results passing project_id param, they are matches.
-    # In other modes, we need to check check_observation_* functions.
+    original_project_members = None
+    if original_check and search_mode == "project":
+        try:
+            original_project_members = fetch_project_membership(
+                [obs_number], project_id_param
+            )
+        except ApiError as error:
+            original_check_failed = True
+            print(
+                "Warning: could not check project membership for the original "
+                f"observation number - {error}"
+            )
 
     original_match = None
     # What the supplied number actually references, whether or not it matched.
@@ -3465,10 +3476,14 @@ def execute_search(args, sink=None):
         obs = original_check[0]
 
         if search_mode == "project":
-            match_found = True
-            print(
-                f"✓ Good news! The original observation number {obs_number} is in project '{project_metadata.get('title')}'."
-            )
+            if (
+                original_project_members is not None
+                and str(obs.get("id")) in original_project_members
+            ):
+                match_found = True
+                print(
+                    f"✓ Good news! The original observation number {obs_number} is in project '{project_metadata.get('title')}'."
+                )
         elif search_mode == "genus" and check_observation_genus(
             obs, genus, target_taxon_id
         ):
@@ -3518,6 +3533,11 @@ def execute_search(args, sink=None):
                 )
                 emit_recorded()
                 return 0
+        elif search_mode == "project" and original_project_members is None:
+            print(
+                f"The original observation #{obs.get('id', obs_number)} exists, "
+                "but its project membership could not be checked."
+            )
         elif search_mode == "taxon_id":
             print(
                 f"The original observation #{obs.get('id', obs_number)} exists but "

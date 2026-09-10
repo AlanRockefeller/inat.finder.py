@@ -872,7 +872,7 @@ class TestInatFinderFunctions(unittest.TestCase):
             inat_finder.main()
 
         # Only the original-number lookup happened - no redundant second request.
-        fetch_observations.assert_called_once_with(["123456789"], project_id=None)
+        fetch_observations.assert_called_once_with(["123456789"])
         batch_check.assert_not_called()
         rendered_output = "\n".join(
             " ".join(str(arg) for arg in call.args) for call in output.call_args_list
@@ -1630,6 +1630,90 @@ class TestOriginalMatchIsPreserved(MainRunnerMixin, unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("Found 1 potential matches", output)
         self.assertEqual(output.count("Observation #123456789"), 1)
+
+
+class TestNormalModeOriginalProjectCheck(MainRunnerMixin, unittest.TestCase):
+    """The supplied ID is resolved before its project membership is evaluated."""
+
+    def _run_project(self, fetch):
+        return self.run_main_json(
+            [
+                "inat_finder.py",
+                "--project",
+                "fungi-map",
+                "123456789",
+                "--digits",
+                "0",
+                "--no-progress",
+                "--yes",
+            ],
+            {
+                "resolve_project_identifier": Mock(return_value=("42", PROJECT)),
+                "fetch_observations": Mock(side_effect=fetch),
+            },
+        )
+
+    def test_nonmember_is_fetched_unfiltered_and_reported_as_existing(self):
+        calls = []
+
+        def fetch(ids, project_id=None, batch_size=None):
+            calls.append((list(ids), project_id))
+            return [] if project_id else [_observation(123456789)]
+
+        status, result, output = self._run_project(fetch)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            calls,
+            [(["123456789"], None), (["123456789"], "42")],
+        )
+        self.assertIn("exists but does not match project 'fungi-map'", output)
+        self.assertNotIn("does not exist", output)
+        self.assertEqual(result["original"]["id"], 123456789)
+        self.assertEqual(result["matches"], [])
+
+    def test_member_is_recognized_by_the_separate_membership_lookup(self):
+        calls = []
+
+        def fetch(ids, project_id=None, batch_size=None):
+            calls.append((list(ids), project_id))
+            return [_observation(123456789)]
+
+        status, result, output = self._run_project(fetch)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(
+            calls,
+            [(["123456789"], None), (["123456789"], "42")],
+        )
+        self.assertIn("is in project 'Fungi Map'", output)
+        self.assertEqual([match["id"] for match in result["matches"]], [123456789])
+
+    def test_nonexistent_observation_does_not_trigger_membership_lookup(self):
+        calls = []
+
+        def fetch(ids, project_id=None, batch_size=None):
+            calls.append((list(ids), project_id))
+            return []
+
+        status, result, _output = self._run_project(fetch)
+
+        self.assertEqual(status, 0)
+        self.assertEqual(calls, [(["123456789"], None)])
+        self.assertIsNone(result["original"])
+
+    def test_membership_failure_preserves_observation_without_claiming_nonmembership(self):
+        def fetch(ids, project_id=None, batch_size=None):
+            if project_id:
+                raise ApiError("probe down")
+            return [_observation(123456789)]
+
+        status, result, output = self._run_project(fetch)
+
+        self.assertEqual(status, inat_finder.API_FAILURE_EXIT_CODE)
+        self.assertIn("exists, but its project membership could not be checked", output)
+        self.assertNotIn("does not match project", output)
+        self.assertEqual(result["original"]["id"], 123456789)
 
 
 class TestNormalModeJsonReportsTheSuppliedObservation(
