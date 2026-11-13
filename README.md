@@ -242,13 +242,17 @@ the next stage is large enough to want confirmation - it prints a resume token:
 
 ```
 To keep searching from here, re-run with:
-  --auto-resume v1:2:200:9f3c1a4e
+  --auto-resume v2:2:200:414471210:9f3c1a4e
 ```
 
 Re-running with that token replays the already-tried candidates offline, with no
 API calls, and carries on from exactly where the previous run stopped. The token is
 bound to the observation number, the clues and the `--digits` cap, so a cursor can
-never be replayed against a search it did not come from.
+never be replayed against a search it did not come from. Copy the token your own run
+printed; the one above is only an example. The token has the form
+`v2:<stage>:<offset>:<ceiling>:<fingerprint>`, where `<ceiling>` is the highest
+observation ID the search tries (0 when the newest-ID lookup failed). Tokens from
+earlier releases (`v1:...`) are no longer accepted; start that search again instead.
 
 A search that stopped because _requests failed_ gets no token. Its failed batches
 are already marked as tried, so a cursor would skip them for good; that run exits
@@ -297,7 +301,7 @@ where a caller gets a bare exit status and nothing to show a user.
   "unusable_clues": [],
   "notices": [],
   "stages": [{ "stage": 0, "total": 1, "attempted": 1, "unchecked": 0 }],
-  "resume": { "stage": 2, "offset": 0, "token": "v1:2:0:35050284" },
+  "resume": { "stage": 2, "offset": 0, "token": "v2:2:0:414471210:35050284" },
   "message": null
 }
 ```

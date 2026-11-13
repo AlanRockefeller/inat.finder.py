@@ -632,6 +632,11 @@ def iter_digit_variations(number_str, digits_off=1, ceiling=None, likely=None):
     if digits_off <= 0:
         yield number_str
         return
+    if ceiling is not None and len(str(ceiling)) < len(number_str):
+        # Every same-length ID is at least 10**(n-1), above a shorter ceiling, so
+        # there is nothing to yield - matching count_digit_variations(). Without
+        # this the loop would build every substitution only to reject each one.
+        return
 
     n = len(number_str)
     for num_changes in range(1, min(digits_off, n) + 1):

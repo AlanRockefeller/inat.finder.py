@@ -4473,8 +4473,24 @@ class TestCommonTypoClasses(unittest.TestCase):
         dropped = {int(v) for v in plain} - {int(v) for v in capped}
         self.assertGreater(len(dropped), plain.total // 10)
         self.assertTrue(all(value > 414471210 for value in dropped))
-        # A number longer than the ceiling has no same-length replacements left.
+        # A number longer than the ceiling has no same-length replacements left,
+        # and the iterator says so without building any of them.
         self.assertEqual(count_digit_variations("1234567890", 2, ceiling=414471210), 0)
+        with patch.object(inat_finder.itertools, "combinations") as combinations:
+            for likely in (None, True, False):
+                self.assertEqual(
+                    list(
+                        iter_digit_variations(
+                            "1234567890", 8, ceiling=414471210, likely=likely
+                        )
+                    ),
+                    [],
+                )
+        combinations.assert_not_called()
+        # A ten-digit number with a large --digits is now a small, fast plan.
+        plan = build_candidate_plan("1234567890", 8, ceiling=414471210)
+        self.assertEqual(plan.replacement_count, 0)
+        self.assertEqual(len(list(plan)), plan.total)
 
     def test_count_honours_the_ceiling_exactly(self):
         for number in ("234101178", "0123", "100", "98765"):
