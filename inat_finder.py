@@ -10,9 +10,13 @@ any of those variations match the specified genus, family, taxon ID, or username
 iNaturalist database.
 
 If the observation number has fewer than 9 digits, it will also try inserting one or two missing
-digits at any position. Longer numbers are also tried with up to two digits removed, and adjacent
-digits are swapped to catch transposition typos. Same-length numbers where one digit was dropped
-and another added (e.g. 234410178 typed as 234101178) are tried too.
+digits at any position. Longer numbers are also tried with up to two digits removed. It also tries
+the common typos that look like several wrong digits but are really one mistake: two digits
+swapped, two or three digits misread as look-alikes in handwriting (1/7, 4/9, 3/8, 5/6, 0/6, 2/7,
+0/8), one digit dropped and another added (234410178 typed as 234101178), and numerically nearby
+IDs (+/-500). With --digits 2 or more it also tries a swap or a missing digit combined with one
+other wrong digit. Look-alike and next-key digits are tried before other substitutions, and IDs
+above the newest observation on iNaturalist are skipped, because they cannot exist yet.
 
 For very short numbers (5 digits or less), it will suggest that the number might be a
 Mushroom Observer observation number instead.
@@ -129,7 +133,7 @@ AUTO_DEFAULT_MAX_DIGITS = 3
 # from an older generation would point at the wrong place, so it is part of the
 # resume fingerprint and an old token is rejected rather than silently misused.
 CANDIDATE_GENERATION_VERSION = 2
-RESUME_TOKEN_VERSION = 1
+RESUME_TOKEN_VERSION = 2
 # Schema version of the --json result object.
 JSON_RESULT_VERSION = 1
 PLACE_FIELDS = "id,name,admin_level,display_name"
@@ -612,13 +616,18 @@ def _replacement_digits(number_str, index, length):
     ]
 
 
-def iter_digit_variations(number_str, digits_off=1):
+def iter_digit_variations(number_str, digits_off=1, ceiling=None, likely=None):
     """Yield replacement variations lazily, one candidate at a time.
 
     Candidates differ from the original in exactly one to ``digits_off`` positions,
     so every candidate is generated once and none equals the original number. This
     is a generator on purpose: the replacement space grows combinatorially and must
     never be materialized in full.
+
+    ``ceiling`` drops candidates above it. ``likely`` splits the space in two:
+    True yields only candidates whose every replaced digit is a look-alike or
+    next-key digit of the original (``LIKELY_DIGITS``), False yields the rest, and
+    None yields everything in plain order.
     """
     if digits_off <= 0:
         yield number_str
@@ -627,45 +636,82 @@ def iter_digit_variations(number_str, digits_off=1):
     n = len(number_str)
     for num_changes in range(1, min(digits_off, n) + 1):
         for indices in itertools.combinations(range(n), num_changes):
-            replacement_options = [
-                _replacement_digits(number_str, index, n) for index in indices
-            ]
+            if likely:
+                replacement_options = [
+                    [
+                        digit
+                        for digit in _replacement_digits(number_str, index, n)
+                        if digit in LIKELY_DIGITS[number_str[index]]
+                    ]
+                    for index in indices
+                ]
+            else:
+                replacement_options = [
+                    _replacement_digits(number_str, index, n) for index in indices
+                ]
             for replacements in itertools.product(*replacement_options):
+                if likely is False and all(
+                    digit in LIKELY_DIGITS[number_str[index]]
+                    for index, digit in zip(indices, replacements)
+                ):
+                    continue
                 candidate = list(number_str)
                 for index, replacement in zip(indices, replacements):
                     candidate[index] = replacement
                 candidate = "".join(candidate)
                 # Only reachable when the input itself has a leading zero.
-                if _is_valid_candidate(candidate):
+                if _is_valid_candidate(candidate) and _under_ceiling(
+                    candidate, ceiling
+                ):
                     yield candidate
 
 
-def count_digit_variations(number_str, digits_off=1):
+def count_digit_variations(number_str, digits_off=1, ceiling=None):
     """Count replacement variations exactly, without generating them.
 
     The count is the number of strings differing from ``number_str`` in one to
     ``digits_off`` positions, honouring the rule that position 0 may never become
-    a zero. It is computed with a small polynomial DP so that the search size is
-    known before any candidate is built.
+    a zero, and - when ``ceiling`` is given - whose value does not exceed it. It is
+    computed with a small digit DP so that the search size is known before any
+    candidate is built.
     """
     n = len(number_str)
     if digits_off <= 0 or n == 0:
         return 0
 
-    # Coefficient k of ``counts`` is the number of variations changing k digits.
-    counts = [1]
+    limit = None
+    if ceiling is not None:
+        limit = str(ceiling)
+        if n > len(limit):
+            return 0
+        if n < len(limit):
+            limit = None
+
+    # counts[(changed, tight)]: prefixes with ``changed`` substitutions, where
+    # ``tight`` means the prefix equals the ceiling's prefix so far.
+    counts = {(0, limit is not None): 1}
+    max_changes = min(digits_off, n)
     for index in range(n):
-        options = len(_replacement_digits(number_str, index, n))
+        original = number_str[index]
         # A leading-zero input can only produce valid IDs by changing position 0.
-        forced = index == 0 and n > 1 and number_str[0] == "0"
-        updated = [0] * (len(counts) + 1)
-        for changed, total in enumerate(counts):
-            if not forced:
-                updated[changed] += total
-            updated[changed + 1] += total * options
+        forced = index == 0 and n > 1 and original == "0"
+        choices = [] if forced else [(original, 0)]
+        choices += [(digit, 1) for digit in _replacement_digits(number_str, index, n)]
+        updated = {}
+        for (changed, tight), total in counts.items():
+            for digit, cost in choices:
+                if changed + cost > max_changes:
+                    continue
+                still_tight = False
+                if tight:
+                    if digit > limit[index]:
+                        continue
+                    still_tight = digit == limit[index]
+                key = (changed + cost, still_tight)
+                updated[key] = updated.get(key, 0) + total
         counts = updated
 
-    return sum(counts[1 : min(digits_off, n) + 1])
+    return sum(total for (changed, _), total in counts.items() if changed >= 1)
 
 
 def generate_digit_variations(number_str, digits_off=1):
@@ -815,9 +861,53 @@ def generate_digit_transpositions(number_str):
     return variations
 
 
+# Digits that are easily misread for one another in handwriting, as on a foray
+# collection label. Symmetric: if a can be read as b, b can be read as a.
+LOOKALIKE_DIGITS = {
+    "0": "68",
+    "1": "7",
+    "2": "7",
+    "3": "8",
+    "4": "9",
+    "5": "6",
+    "6": "05",
+    "7": "12",
+    "8": "03",
+    "9": "4",
+}
+# Neighbouring keys on the number row (1234567890), the commonest slip of the
+# finger when an ID is typed rather than read.
+NEXT_KEY_DIGITS = {
+    "1": "2",
+    "2": "13",
+    "3": "24",
+    "4": "35",
+    "5": "46",
+    "6": "57",
+    "7": "68",
+    "8": "79",
+    "9": "80",
+    "0": "9",
+}
+# A wrong digit that is one of these is tried before the other replacements.
+LIKELY_DIGITS = {
+    digit: "".join(sorted(set(LOOKALIKE_DIGITS[digit]) | set(NEXT_KEY_DIGITS[digit])))
+    for digit in "0123456789"
+}
+# How far either side of the supplied number numerically nearby IDs are tried.
+NEARBY_ID_RADIUS = 500
+# Headroom above the newest observation ID, so an observation uploaded while the
+# search is starting, or not yet in the search index, is still reachable.
+ID_CEILING_MARGIN = 1000
+
+
 def _hamming_distance(a, b):
     """Number of positions at which two equal-length strings differ."""
     return sum(1 for x, y in zip(a, b) if x != y)
+
+
+def _under_ceiling(candidate, ceiling):
+    return ceiling is None or int(candidate) <= ceiling
 
 
 def generate_digit_shifts(number_str, min_hamming=1):
@@ -828,7 +918,7 @@ def generate_digit_shifts(number_str, min_hamming=1):
     neighbouring one is doubled or misplaced, so everything between the two
     positions slides over by one (234410178 typed as 234101178). As a
     substitution it can touch many positions at once; as an edit it is just one
-    deletion plus one insertion, at most ``n * (n + 1) * 10`` candidates.
+    deletion plus one insertion, at most ``n * n * 10`` candidates.
 
     Only candidates differing from the original in more than ``min_hamming``
     positions are kept, so a plan can exclude what its substitution search
@@ -861,53 +951,208 @@ def generate_digit_shifts(number_str, min_hamming=1):
     return variations
 
 
-class CandidatePlan:
-    """A deduplicated search space that is sized up front and streamed on demand.
-
-    Replacement variations are counted exactly with :func:`count_digit_variations`
-    and generated lazily, so a huge ``--digits`` value never builds a list. The much
-    smaller insertion, removal, transposition and shift classes are materialized
-    once (a few thousand candidates at most) so the total is exact.
-
-    The candidate classes cannot collide with each other: insertions and removals
-    change the number's length, and transpositions - which do not - are only added
-    when ``digits_off`` is below 2, because a two-digit replacement search already
-    contains every adjacent swap. That means no observation ID is ever requested
-    twice and ``total`` is the true number of API-checked candidates. Shifts (one
-    digit dropped, another added) keep the length too, so only those differing in
-    more than ``digits_off`` positions are added; the rest are replacements.
+def generate_digit_swaps(number_str):
     """
+    Generate variations that swap any two digits, adjacent swaps first.
 
-    def __init__(self, number_str, digits_off, add_digits=True, remove_digits=True):
-        self.number_str = number_str
-        self.digits_off = digits_off
-        self.replacement_count = count_digit_variations(number_str, digits_off)
-        self.additions = []
-        self.removals = []
-        self.transpositions = []
-        self.shifts = []
-
-        if digits_off > 0:
-            if add_digits:
-                self.additions = list(iter_digit_insertions(number_str, 2))
-            if remove_digits:
-                self.removals = generate_digit_removals(number_str, 2)
-            if digits_off < 2:
-                # With --digits 2 or more every adjacent swap is already a
-                # two-digit replacement, so adding them would duplicate requests.
-                self.transpositions = generate_digit_transpositions(number_str)
-            self.shifts = generate_digit_shifts(number_str, digits_off)
-
-        seen = {int(number_str)} if number_str.isdigit() and number_str else set()
-        self.extras = []
-        for candidate in itertools.chain(
-            self.additions, self.removals, self.transpositions, self.shifts
-        ):
+    Adjacent transpositions (123456789 -> 123465789) are by far the commonest, so
+    they come first; swaps of digits further apart (123456789 -> 123654789) follow,
+    nearest first. Swaps of equal digits and leading-zero results are skipped.
+    """
+    seen = set()
+    variations = []
+    n = len(number_str)
+    for gap in range(1, n):
+        for index in range(n - gap):
+            other = index + gap
+            if number_str[index] == number_str[other]:
+                continue
+            chars = list(number_str)
+            chars[index], chars[other] = chars[other], chars[index]
+            candidate = "".join(chars)
+            if not _is_valid_candidate(candidate):
+                continue
             numeric = int(candidate)
             if numeric in seen:
                 continue
             seen.add(numeric)
-            self.extras.append(candidate)
+            variations.append(candidate)
+    return variations
+
+
+def generate_lookalike_substitutions(number_str, min_changes=2, max_changes=3):
+    """
+    Generate variations where several digits were misread as look-alikes.
+
+    One misread digit is already a one-digit substitution. Two or three, each
+    replaced only by a digit it is easily confused with in handwriting (see
+    ``LOOKALIKE_DIGITS``), are a few hundred candidates, against tens of thousands
+    for arbitrary two- and three-digit substitutions.
+    """
+    seen = set()
+    variations = []
+    n = len(number_str)
+    for count in range(max(1, min_changes), min(max_changes, n) + 1):
+        for positions in itertools.combinations(range(n), count):
+            options = [LOOKALIKE_DIGITS.get(number_str[p], "") for p in positions]
+            for replacements in itertools.product(*options):
+                chars = list(number_str)
+                for position, digit in zip(positions, replacements):
+                    chars[position] = digit
+                candidate = "".join(chars)
+                if not _is_valid_candidate(candidate):
+                    continue
+                numeric = int(candidate)
+                if numeric in seen:
+                    continue
+                seen.add(numeric)
+                variations.append(candidate)
+    return variations
+
+
+def generate_nearby_ids(number_str, radius=NEARBY_ID_RADIUS):
+    """
+    Generate numerically nearby IDs, closest first (+1, -1, +2, -2, ...).
+
+    This catches the ID of a neighbouring observation from the same upload
+    session being written down, which crosses digit boundaries (...178 vs ...203)
+    and so can look like several wrong digits.
+    """
+    if not number_str.isdigit():
+        return []
+    value = int(number_str)
+    variations = []
+    for distance in range(1, radius + 1):
+        for candidate in (value + distance, value - distance):
+            if candidate > 0:
+                variations.append(str(candidate))
+    return variations
+
+
+def generate_swap_plus_substitution(number_str):
+    """Generate an adjacent swap combined with one other wrong digit."""
+    seen = set()
+    variations = []
+    for swapped in generate_digit_transpositions(number_str):
+        for index in range(len(swapped)):
+            for digit in _replacement_digits(swapped, index, len(swapped)):
+                candidate = swapped[:index] + digit + swapped[index + 1 :]
+                if candidate == number_str or not _is_valid_candidate(candidate):
+                    continue
+                numeric = int(candidate)
+                if numeric in seen:
+                    continue
+                seen.add(numeric)
+                variations.append(candidate)
+    return variations
+
+
+def generate_insertion_plus_substitution(number_str):
+    """Generate one missing digit restored combined with one other wrong digit."""
+    seen = set()
+    variations = []
+    for inserted in iter_digit_insertions(number_str, 1):
+        for index in range(len(inserted)):
+            for digit in _replacement_digits(inserted, index, len(inserted)):
+                candidate = inserted[:index] + digit + inserted[index + 1 :]
+                if not _is_valid_candidate(candidate):
+                    continue
+                numeric = int(candidate)
+                if numeric in seen:
+                    continue
+                seen.add(numeric)
+                variations.append(candidate)
+    return variations
+
+
+class CandidatePlan:
+    """A deduplicated search space that is sized up front and streamed on demand.
+
+    Replacement variations (arbitrary substituted digits) are counted exactly with
+    :func:`count_digit_variations` and generated lazily, so a huge ``--digits``
+    value never builds a list. Every other class is small and materialized once,
+    so the total is exact.
+
+    No observation ID is ever requested twice. Extra candidates are deduplicated
+    against each other, and a same-length extra that differs from the number in
+    ``digits_off`` positions or fewer is dropped, because the replacement search
+    already yields it. That rule is also why the plans nest as sets - a class
+    entry is either in the extras or, at a wider ``digits_off``, a replacement.
+
+    ``ceiling``, when given, drops every candidate above it: iNaturalist hands out
+    IDs in order, so nothing above the newest observation can exist yet.
+
+    The order is part of the contract, because a resume cursor is a position in
+    it: the likely replacements (look-alike and next-key digits) first, then the
+    extras, then the remaining replacements. Stages that stop at the first full
+    match therefore meet the most plausible typos first.
+    """
+
+    # (attribute, description) in the order the extras are yielded.
+    EXTRA_CLASSES = (
+        ("transpositions", "swapping two digits"),
+        ("lookalikes", "misreading look-alike digits"),
+        ("shifts", "dropping one digit and adding another"),
+        ("additions", "adding digits"),
+        ("removals", "removing digits"),
+        ("nearby", "trying numerically nearby IDs"),
+        ("swap_substitutions", "a swap plus one wrong digit"),
+        ("insertion_substitutions", "a missing digit plus one wrong digit"),
+    )
+
+    def __init__(
+        self, number_str, digits_off, add_digits=True, remove_digits=True, ceiling=None
+    ):
+        self.number_str = number_str
+        self.digits_off = digits_off
+        self.ceiling = ceiling
+        self.replacement_count = count_digit_variations(
+            number_str, digits_off, ceiling=ceiling
+        )
+        for attribute, _ in self.EXTRA_CLASSES:
+            setattr(self, attribute, [])
+
+        if digits_off > 0:
+            if digits_off < 2:
+                # With --digits 2 or more every swap is already a two-digit
+                # replacement, so adding them would duplicate requests.
+                self.transpositions = generate_digit_swaps(number_str)
+            self.lookalikes = generate_lookalike_substitutions(
+                number_str, min_changes=digits_off + 1
+            )
+            self.shifts = generate_digit_shifts(number_str, digits_off)
+            if add_digits:
+                self.additions = list(iter_digit_insertions(number_str, 2))
+            if remove_digits:
+                self.removals = generate_digit_removals(number_str, 2)
+            self.nearby = generate_nearby_ids(number_str)
+            if digits_off >= 2:
+                self.swap_substitutions = generate_swap_plus_substitution(number_str)
+                if add_digits:
+                    self.insertion_substitutions = (
+                        generate_insertion_plus_substitution(number_str)
+                    )
+
+        seen = {int(number_str)} if number_str.isdigit() and number_str else set()
+        self.extras = []
+        self.class_counts = {}
+        for attribute, _ in self.EXTRA_CLASSES:
+            added = 0
+            for candidate in getattr(self, attribute):
+                if not _under_ceiling(candidate, ceiling):
+                    continue
+                if (
+                    len(candidate) == len(number_str)
+                    and _hamming_distance(candidate, number_str) <= digits_off
+                ):
+                    continue
+                numeric = int(candidate)
+                if numeric in seen:
+                    continue
+                seen.add(numeric)
+                self.extras.append(candidate)
+                added += 1
+            self.class_counts[attribute] = added
 
         self.total = self.replacement_count + len(self.extras)
 
@@ -916,8 +1161,14 @@ class CandidatePlan:
 
     def __iter__(self):
         if self.digits_off > 0:
-            yield from iter_digit_variations(self.number_str, self.digits_off)
+            yield from iter_digit_variations(
+                self.number_str, self.digits_off, ceiling=self.ceiling, likely=True
+            )
         yield from self.extras
+        if self.digits_off > 0:
+            yield from iter_digit_variations(
+                self.number_str, self.digits_off, ceiling=self.ceiling, likely=False
+            )
 
     def describe(self):
         """Return human-readable lines describing where candidates come from."""
@@ -927,21 +1178,10 @@ class CandidatePlan:
                 f"{self.replacement_count} variations by changing up to "
                 f"{self.digits_off} digit(s)"
             )
-        if self.additions:
-            lines.append(f"{len(self.additions)} variations by adding digits")
-        if self.removals:
-            lines.append(f"{len(self.removals)} variations by removing digits")
-        if self.transpositions:
-            lines.append(
-                f"{len(self.transpositions)} variations by swapping adjacent digits"
-            )
-        shift_count = len(self.shifts) - len(
-            set(self.transpositions).intersection(self.shifts)
-        )
-        if shift_count:
-            lines.append(
-                f"{shift_count} variations by dropping one digit and adding another"
-            )
+        for attribute, description in self.EXTRA_CLASSES:
+            count = self.class_counts.get(attribute, 0)
+            if count:
+                lines.append(f"{count} variations by {description}")
         return lines
 
 
@@ -952,35 +1192,38 @@ def auto_stage_label(index, plan):
     """Describe a ladder stage in terms of what it really searches.
 
     Deliberately derived from the plan rather than hard-coded, because
-    :class:`CandidatePlan` does not add one edit class per ``digits_off``: it
-    always tries up to two inserted and two removed digits when those classes are
-    enabled at all, and it contributes adjacent swaps only below two substituted
-    digits. Describing stage 1 as "one digit off" would be a plain lie about what
-    the tool checked.
+    :class:`CandidatePlan` does not add one edit class per ``digits_off``. Describing
+    stage 1 as "one digit off" would be a plain lie about what the tool checked.
     """
     if index <= 0:
         return "the number exactly as supplied"
 
+    counts = getattr(plan, "class_counts", {})
     ordinal = _STAGE_ORDINALS.get(index, str(index))
     digit_word = "digit" if index == 1 else "digits"
     parts = [f"{ordinal} substituted {digit_word}"]
-    if plan.transpositions:
-        parts.append("adjacent swaps")
-    if plan.shifts:
+    if counts.get("transpositions"):
+        parts.append("swapped digits")
+    if counts.get("lookalikes"):
+        parts.append("look-alike digits")
+    if counts.get("shifts"):
         parts.append("shifted digits")
-    if plan.additions and plan.removals:
+    if counts.get("additions") and counts.get("removals"):
         parts.append("missing or extra digits")
-    elif plan.additions:
+    elif counts.get("additions"):
         parts.append("missing digits")
-    elif plan.removals:
+    elif counts.get("removals"):
         parts.append("extra digits")
+    if counts.get("nearby"):
+        parts.append("nearby numbers")
+    if counts.get("swap_substitutions") or counts.get("insertion_substitutions"):
+        parts.append("a swap or missing digit plus a wrong digit")
 
     if len(parts) == 1:
         return parts[0]
     if len(parts) == 2:
         return f"{parts[0]} and {parts[1]}"
     return ", ".join(parts[:-1]) + f", and {parts[-1]}"
-
 
 class AutoStage:
     """One rung of the --auto ladder: a plan minus every candidate already tried.
@@ -1029,7 +1272,7 @@ class AutoStage:
         return self.plan_position >= self.plan.total
 
 
-def build_candidate_plan(number_str, digits_off):
+def build_candidate_plan(number_str, digits_off, ceiling=None):
     """Build the plan for one ladder stage, using the caller-independent rules.
 
     Insertions only make sense below nine digits and removals only above five, so
@@ -1038,8 +1281,35 @@ def build_candidate_plan(number_str, digits_off):
     add_digits = digits_off > 0 and len(number_str) < 9
     remove_digits = digits_off > 0 and len(number_str) > 5
     return CandidatePlan(
-        number_str, digits_off, add_digits=add_digits, remove_digits=remove_digits
+        number_str,
+        digits_off,
+        add_digits=add_digits,
+        remove_digits=remove_digits,
+        ceiling=ceiling,
     )
+
+
+def fetch_id_ceiling(message_callback=print):
+    """Return the highest observation ID worth trying, or None if unknown.
+
+    iNaturalist assigns IDs in upload order, so no candidate above the newest
+    observation can exist yet. ``ID_CEILING_MARGIN`` of headroom covers uploads
+    made while the search starts. A failed lookup is not fatal: the search simply
+    checks everything, as it always used to.
+    """
+    try:
+        data = api_get_json(
+            "/observations",
+            params={"order_by": "id", "order": "desc", "per_page": 1, "only_id": "true"},
+        )
+        newest = int(data["results"][0]["id"])
+    except (ApiError, KeyError, IndexError, TypeError, ValueError):
+        message_callback(
+            "Could not look up the newest observation ID, so candidates above it "
+            "will be checked too."
+        )
+        return None
+    return newest + ID_CEILING_MARGIN
 
 
 def search_fingerprint(number_str, criteria, digits_cap):
@@ -1061,13 +1331,20 @@ def search_fingerprint(number_str, criteria, digits_cap):
     return digest[:8]
 
 
-def build_resume_token(stage, offset, fingerprint):
-    """Format a resume cursor as ``v1:<stage>:<offset>:<fingerprint>``."""
-    return f"v{RESUME_TOKEN_VERSION}:{stage}:{offset}:{fingerprint}"
+def build_resume_token(stage, offset, fingerprint, ceiling=None):
+    """Format a resume cursor as ``v2:<stage>:<offset>:<ceiling>:<fingerprint>``.
+
+    The ID ceiling travels with the cursor because it shapes the plans: replaying
+    them against a newer ceiling would put the cursor in the wrong place. A
+    ceiling of 0 means none was applied.
+    """
+    return f"v{RESUME_TOKEN_VERSION}:{stage}:{offset}:{ceiling or 0}:{fingerprint}"
 
 
 def parse_resume_token(token):
-    """Return ``(stage, offset, fingerprint)`` from a resume token.
+    """Return ``(stage, offset, ceiling, fingerprint)`` from a resume token.
+
+    ``ceiling`` is None when the original search applied no ID ceiling.
 
     Raises:
         ValueError: The token is not a resume cursor this version understands.
@@ -1078,21 +1355,27 @@ def parse_resume_token(token):
         raise ValueError(
             f"resume token must be text, not {type(token).__name__}"
         ) from error
-    if len(parts) != 4:
-        raise ValueError(f"'{token}' is not a resume token")
-    version, stage, offset, fingerprint = parts
+    version = parts[0]
     if not version.startswith("v") or not version[1:].isdigit():
         raise ValueError(f"'{token}' is not a resume token")
     if int(version[1:]) != RESUME_TOKEN_VERSION:
         raise ValueError(
             f"resume token version {version[1:]} is not supported by this release"
         )
-    if not stage.isdigit() or not offset.isdigit() or not fingerprint:
+    if len(parts) != 5:
         raise ValueError(f"'{token}' is not a resume token")
-    return int(stage), int(offset), fingerprint
+    _, stage, offset, ceiling, fingerprint = parts
+    if (
+        not stage.isdigit()
+        or not offset.isdigit()
+        or not ceiling.isdigit()
+        or not fingerprint
+    ):
+        raise ValueError(f"'{token}' is not a resume token")
+    return int(stage), int(offset), (int(ceiling) or None), fingerprint
 
 
-def restore_seen_ids(number_str, stage_index, offset):
+def restore_seen_ids(number_str, stage_index, offset, ceiling=None):
     """Rebuild the already-tried set a resume cursor implies. No API calls.
 
     Replaying is exact rather than approximate: candidate generation is
@@ -1102,10 +1385,12 @@ def restore_seen_ids(number_str, stage_index, offset):
     """
     seen = set()
     for index in range(1, stage_index):
-        for candidate in build_candidate_plan(number_str, index):
+        for candidate in build_candidate_plan(number_str, index, ceiling):
             seen.add(int(candidate))
     if offset > 0 and stage_index > 0:
-        for position, candidate in enumerate(build_candidate_plan(number_str, stage_index)):
+        for position, candidate in enumerate(
+            build_candidate_plan(number_str, stage_index, ceiling)
+        ):
             if position >= offset:
                 break
             seen.add(int(candidate))
@@ -2365,6 +2650,33 @@ STATUS_EXIT_CODES = {
 }
 
 
+def typo_distance(a, b):
+    """Edit distance between two digit strings, counting an adjacent swap as one.
+
+    This is the optimal-string-alignment form of Damerau-Levenshtein: a wrong,
+    missing or extra digit costs one, and so does swapping two neighbours. It
+    ranks equally scored matches by how plausible a typo they are, which numeric
+    distance alone cannot do - an ID 95 away from the one typed can differ in
+    three digits, while a two-digit look-alike misreading is millions away.
+    """
+    a, b = str(a), str(b)
+    previous_row = None
+    row = list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        before, previous_row, row = previous_row, row, [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            row[j] = min(previous_row[j] + 1, row[j - 1] + 1, previous_row[j - 1] + cost)
+            if (
+                before is not None
+                and j > 1
+                and a[i - 1] == b[j - 2]
+                and a[i - 2] == b[j - 1]
+            ):
+                row[j] = min(row[j], before[j - 2] + 1)
+    return row[len(b)]
+
+
 def rank_matches(matches, origin=None):
     """Deduplicate by observation ID and sort best-first.
 
@@ -2375,9 +2687,10 @@ def rank_matches(matches, origin=None):
     are the common case, not the rare one: with a single clue every hit scores
     1 of 1, so without a tie-break the "best" match would be whichever candidate
     happened to have the lowest ID. Ties therefore break on the stage that found
-    the match (fewer digits off is a likelier typo), then on numeric distance from
-    the number the user actually typed, and only then on ID, which keeps the order
-    stable between runs - something a page that diffs results depends on.
+    the match (fewer digits off is a likelier typo), then on :func:`typo_distance`
+    from the number the user actually typed, then on numeric distance, and only
+    then on ID, which keeps the order stable between runs - something a page that
+    diffs results depends on.
 
     Args:
         origin: The observation number as supplied, if known. Only used for the
@@ -2401,8 +2714,12 @@ def rank_matches(matches, origin=None):
         # A non-auto search leaves stage None; those sort after every staged
         # match rather than ahead of stage 0.
         stage = match.stage if match.stage is not None else math.inf
-        distance = abs(obs_id - origin_value) if origin_value is not None else 0
-        return (-len(match.matched), stage, distance, obs_id)
+        if origin_value is None:
+            edits = distance = 0
+        else:
+            edits = typo_distance(origin_value, obs_id)
+            distance = abs(obs_id - origin_value)
+        return (-len(match.matched), stage, edits, distance, obs_id)
 
     return sorted(best.values(), key=sort_key)
 
@@ -2858,10 +3175,11 @@ def run_auto_mode(
     seen_ids = set()
     start_stage = 1
     resuming = False
+    ceiling = None
     if resume_token:
         try:
-            start_stage, start_offset, token_fingerprint = parse_resume_token(
-                resume_token
+            start_stage, start_offset, ceiling, token_fingerprint = (
+                parse_resume_token(resume_token)
             )
         except ValueError as error:
             return SearchOutcome(
@@ -2893,7 +3211,9 @@ def run_auto_mode(
                 ),
                 exit_code=1,
             )
-        resume_plan_total = build_candidate_plan(obs_number, start_stage).total
+        resume_plan_total = build_candidate_plan(
+            obs_number, start_stage, ceiling
+        ).total
         if not 0 <= start_offset <= resume_plan_total:
             return SearchOutcome(
                 status="error",
@@ -2904,7 +3224,7 @@ def run_auto_mode(
                 ),
                 exit_code=1,
             )
-        seen_ids = restore_seen_ids(obs_number, start_stage, start_offset)
+        seen_ids = restore_seen_ids(obs_number, start_stage, start_offset, ceiling)
         resuming = True
         message_callback(
             f"Resuming at stage {start_stage}, {len(seen_ids)} candidate(s) "
@@ -2939,7 +3259,7 @@ def run_auto_mode(
         return {
             "stage": stage_index,
             "offset": offset,
-            "token": build_resume_token(stage_index, offset, fingerprint),
+            "token": build_resume_token(stage_index, offset, fingerprint, ceiling),
         }
 
     def finish(status, reason, message=None, estimated=None, seconds=None):
@@ -3057,8 +3377,12 @@ def run_auto_mode(
                 "the search beyond the number as given.",
             )
 
+        if not resuming:
+            # A resumed search keeps the ceiling it started with, from its token.
+            ceiling = fetch_id_ceiling(message_callback)
+
         for index in range(max(1, start_stage), digits_cap + 1):
-            plan = build_candidate_plan(obs_number, index)
+            plan = build_candidate_plan(obs_number, index, ceiling)
             stage = AutoStage(index, plan, seen_ids)
             last_stage = index
             last_stage_total = stage.total
@@ -3713,7 +4037,11 @@ def execute_search(args, sink=None):
         )
 
     plan = CandidatePlan(
-        obs_number, digits_off, add_digits=add_digits, remove_digits=remove_digits
+        obs_number,
+        digits_off,
+        add_digits=add_digits,
+        remove_digits=remove_digits,
+        ceiling=fetch_id_ceiling() if digits_off > 0 else None,
     )
     for line in plan.describe():
         print(f"Generated {line}")
