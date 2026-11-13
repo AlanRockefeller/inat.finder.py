@@ -24,8 +24,10 @@ from inat_finder import (
     count_digit_variations,
     generate_digit_additions,
     generate_digit_removals,
+    generate_digit_shifts,
     generate_digit_transpositions,
     generate_digit_variations,
+    iter_digit_variations,
     parse_inat_url,
     parse_resume_token,
     preprocess_argv_for_project_name,
@@ -1003,6 +1005,8 @@ class MainRunnerMixin:
         patches = dict(patches or {})
         if expect_locations and "resolve_observation_locations" not in patches:
             patches["resolve_observation_locations"] = Mock(return_value={})
+        # The newest-ID lookup is an extra API call; tests opt in to a ceiling.
+        patches.setdefault("fetch_id_ceiling", Mock(return_value=None))
 
         status = 0
         with contextlib.ExitStack() as stack:
@@ -1367,7 +1371,8 @@ class TestCandidatePlanning(unittest.TestCase):
         plan = CandidatePlan("123456789", 4, add_digits=False, remove_digits=False)
         self.assertGreater(plan.total, 800000)
         # Nothing large was built: only the bounded extra classes are stored.
-        self.assertEqual(plan.extras, [])
+        self.assertEqual(plan.extras, plan.shifts)
+        self.assertLess(len(plan.extras), 1000)
         self.assertIsInstance(iter(plan), types.GeneratorType)
         self.assertEqual(len(list(itertools.islice(plan, 5))), 5)
 
@@ -1384,6 +1389,21 @@ class TestCandidatePlanning(unittest.TestCase):
         self.assertIn("123499", variations)
         self.assertEqual(len(variations), len(set(variations)))
         self.assertTrue(all(not v.startswith("0") for v in variations))
+
+    def test_shifted_digit_typo_is_in_stage_one(self):
+        # Reported miss: 234410178 typed as 234101178 - a "4" dropped and a "1"
+        # doubled. That is three substitutions but only one shift.
+        plan = build_candidate_plan("234101178", 1)
+        self.assertIn("234410178", list(plan))
+        self.assertIn("234410178", plan.shifts)
+
+    def test_shifts_skip_what_substitutions_cover(self):
+        for digits_off in (1, 2, 3):
+            for candidate in generate_digit_shifts("234101178", digits_off):
+                self.assertEqual(len(candidate), 9)
+                differing = sum(a != b for a, b in zip(candidate, "234101178"))
+                self.assertGreater(differing, digits_off)
+        self.assertNotIn("012", generate_digit_shifts("102"))
 
     def test_adjacent_transpositions(self):
         self.assertIn("123465789", generate_digit_transpositions("123456789"))
@@ -1428,7 +1448,7 @@ class TestSearchSizeSafety(MainRunnerMixin, unittest.TestCase):
                 ),
             )
         self.assertEqual(status, 0)
-        self.assertIn("61937 total unique variations", output)
+        self.assertIn("62543 total unique variations", output)
         # The confirmation prompt is asked before any candidate is generated.
         self.assertIn("This is a large search", prompt.call_args.args[0])
         self.assertIn("Exiting search.", output)
@@ -2750,12 +2770,16 @@ class TestAutoModeLadder(AutoModeMixin, unittest.TestCase):
         self.assertIn("Observation #123456788", output)
         self.assertIn("Stage 1", output)
         self.assertNotIn("Stage 2", output)
-        # Stage 0 is one ID; stage 1 for a nine-digit number is a single batch.
-        self.assertEqual(len(calls), 2)
+        # Stage 0 is one ID, then stage 1 in full - and nothing more.
+        stage_one_batches = -(
+            -build_candidate_plan("123456789", 1).total // inat_finder.BATCH_SIZE
+        )
+        self.assertEqual(len(calls), 1 + stage_one_batches)
 
     def test_empty_stage_one_escalates_to_stage_two(self):
-        # 123456700 differs from 123456789 in two digits, so only stage 2 has it.
-        fetch, _calls = self.fetcher({123456700})
+        # 123454589 differs from 123456789 in two digits and is not a swap,
+        # look-alike, shift or nearby number, so only stage 2 has it.
+        fetch, _calls = self.fetcher({123454589})
         status, output = self.run_main(
             [
                 "inat_finder.py",
@@ -2773,7 +2797,7 @@ class TestAutoModeLadder(AutoModeMixin, unittest.TestCase):
         )
         self.assertEqual(status, 0)
         self.assertIn("Stage 2", output)
-        self.assertIn("Observation #123456700", output)
+        self.assertIn("Observation #123454589", output)
         self.assertIn("Found at stage 2", output)
 
     def test_a_small_stage_is_finished_after_a_full_match(self):
@@ -2817,7 +2841,8 @@ class TestAutoModeLadder(AutoModeMixin, unittest.TestCase):
         stage_two_batches = (
             len(stage_two) + inat_finder.BATCH_SIZE - 1
         ) // inat_finder.BATCH_SIZE
-        self.assertEqual(len(calls), 2 + stage_two_batches)
+        stage_one_batches = -(-len(stage_one) // inat_finder.BATCH_SIZE)
+        self.assertEqual(len(calls), 1 + stage_one_batches + stage_two_batches)
         # And it still stops there rather than climbing to stage 3.
         self.assertNotIn("Stage 3", output)
 
@@ -2959,7 +2984,9 @@ class TestAutoModeLadder(AutoModeMixin, unittest.TestCase):
         """Stage 1 is never just 'one digit off'."""
         label = inat_finder.auto_stage_label(1, build_candidate_plan("123456789", 1))
         self.assertIn("one substituted digit", label)
-        self.assertIn("adjacent swaps", label)
+        self.assertIn("swapped digits", label)
+        self.assertIn("look-alike digits", label)
+        self.assertIn("nearby numbers", label)
         # Nine digits: removals apply, insertions do not.
         self.assertIn("extra digits", label)
         self.assertNotIn("missing", label)
@@ -2967,7 +2994,8 @@ class TestAutoModeLadder(AutoModeMixin, unittest.TestCase):
         self.assertIn("missing or extra digits", short)
         self.assertEqual(
             inat_finder.auto_stage_label(2, build_candidate_plan("123456789", 2)),
-            "two substituted digits and extra digits",
+            "two substituted digits, look-alike digits, shifted digits, extra "
+            "digits, nearby numbers, and a swap or missing digit plus a wrong digit",
         )
 
 
@@ -3191,15 +3219,15 @@ class TestAutoModeClues(AutoModeMixin, unittest.TestCase):
 
     def test_partial_match_does_not_end_the_ladder(self):
         """A near miss is a reason to keep looking, not a reason to stop."""
-        # 123456788 matches the genus only; 123456700 matches genus and user, and
+        # 123456788 matches the genus only; 123454589 matches genus and user, and
         # lives two digits away, so it can only be found by widening to stage 2.
         def fetch(ids, project_id=None, batch_size=None):
             found = []
             for value in ids:
                 if int(value) == 123456788:
                     found.append(_observation(123456788, login="someone_else"))
-                elif int(value) == 123456700:
-                    found.append(_observation(123456700, login="observer"))
+                elif int(value) == 123454589:
+                    found.append(_observation(123454589, login="observer"))
             return found
 
         status, output = self.run_main(
@@ -3223,7 +3251,7 @@ class TestAutoModeClues(AutoModeMixin, unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertIn("Stage 2", output)
         # Best-first: the full match outranks the partial one.
-        first = output.index("1. Observation #123456700")
+        first = output.index("1. Observation #123454589")
         second = output.index("2. Observation #123456788")
         self.assertLess(first, second)
         self.assertIn("[2 of 2: genus, user]", output)
@@ -3265,7 +3293,10 @@ class TestAutoModeProjects(AutoModeMixin, unittest.TestCase):
         # One request per search batch, every one of them carrying the project
         # filter. Stage 0 is deliberately unfiltered - it asks what the supplied
         # number is, which a membership filter would refuse to answer.
-        self.assertEqual(len(calls), 2)
+        stage_one_batches = -(
+            -build_candidate_plan("123456789", 1).total // inat_finder.BATCH_SIZE
+        )
+        self.assertEqual(len(calls), 1 + stage_one_batches)
         self.assertIsNone(calls[0]["project_id"])
         self.assertEqual(calls[0]["ids"], ["123456789"])
         self.assertTrue(all(call["project_id"] == "42" for call in calls[1:]))
@@ -3411,12 +3442,27 @@ class TestAutoModeResume(AutoModeMixin, unittest.TestCase):
 
     def test_token_round_trip(self):
         self.assertEqual(
+            parse_resume_token(build_resume_token(2, 400, "abc12345", 414471210)),
+            (2, 400, 414471210, "abc12345"),
+        )
+        # No ceiling travels as 0 and comes back as None.
+        self.assertEqual(
             parse_resume_token(build_resume_token(2, 400, "abc12345")),
-            (2, 400, "abc12345"),
+            (2, 400, None, "abc12345"),
         )
 
     def test_malformed_tokens_are_rejected(self):
-        for value in ("", "2:400", "v1:2:400", "v9:2:400:abc", "vx:2:400:abc", 7):
+        for value in (
+            "",
+            "2:400",
+            "v1:2:400",
+            "v1:2:400:abc",
+            "v2:2:400:abc",
+            "v2:2:400:x:abc",
+            "v9:2:400:0:abc",
+            "vx:2:400:0:abc",
+            7,
+        ):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 parse_resume_token(value)
 
@@ -4350,6 +4396,220 @@ class TestJsonSubprocessContract(unittest.TestCase):
         status, payload, _stderr = self.invoke("--js", "--genus", "Amanita")
         self.assertEqual(status, 2)
         self.assertEqual(payload["stop_reason"], "usage")
+
+
+class TestCommonTypoClasses(unittest.TestCase):
+    """The cheap typo classes that sit ahead of arbitrary substitutions."""
+
+    NUMBER = "234101178"
+
+    def plan(self, digits, number=None, ceiling=None):
+        return list(build_candidate_plan(number or self.NUMBER, digits, ceiling))
+
+    def test_distant_swaps_are_in_stage_one(self):
+        # Digits three apart swapped; that is two substitutions, not one.
+        self.assertIn("234171108", self.plan(1))
+        swaps = inat_finder.generate_digit_swaps("123456789")
+        # Adjacent swaps come first, exactly as generate_digit_transpositions has them.
+        self.assertEqual(swaps[:8], generate_digit_transpositions("123456789"))
+        self.assertIn("923456781", swaps)
+
+    def test_multiple_lookalike_digits_are_in_stage_one(self):
+        # Two 1s misread as 7s, and a 2 read as 7, a 3 as 8 and a 4 as 9.
+        stage_one = self.plan(1)
+        self.assertIn("234707178", stage_one)
+        self.assertIn("789101178", stage_one)
+        lookalikes = inat_finder.generate_lookalike_substitutions(self.NUMBER)
+        for candidate in lookalikes:
+            changed = [
+                (a, b) for a, b in zip(self.NUMBER, candidate) if a != b
+            ]
+            self.assertIn(len(changed), (2, 3))
+            for original, replacement in changed:
+                self.assertIn(replacement, inat_finder.LOOKALIKE_DIGITS[original])
+
+    def test_nearby_ids_are_in_stage_one_closest_first(self):
+        stage_one = self.plan(1)
+        self.assertIn(str(int(self.NUMBER) + 500), stage_one)
+        self.assertIn(str(int(self.NUMBER) - 437), stage_one)
+        self.assertNotIn(str(int(self.NUMBER) + 501), stage_one)
+        self.assertEqual(
+            inat_finder.generate_nearby_ids("1000")[:4], ["1001", "999", "1002", "998"]
+        )
+        self.assertNotIn("0", inat_finder.generate_nearby_ids("3"))
+
+    def test_swap_plus_wrong_digit_is_in_stage_two(self):
+        self.assertNotIn("320101178", self.plan(1))
+        self.assertIn("320101178", self.plan(2))
+
+    def test_missing_plus_wrong_digit_is_in_stage_two(self):
+        # 274410178 typed as 23441017: the 8 was dropped and the 7 read as a 3.
+        self.assertNotIn("274410178", self.plan(1, "23441017"))
+        self.assertIn("274410178", self.plan(2, "23441017"))
+        # Nine digits: insertions do not apply, so neither does this class.
+        self.assertEqual(
+            build_candidate_plan(self.NUMBER, 2).insertion_substitutions, []
+        )
+
+    def test_plans_are_exact_unique_and_nested_for_every_shape(self):
+        for number in ("12345", "1223334", "23441017", "234101178", "1000000000"):
+            for ceiling in (None, 234000000, 414471210):
+                previous = set()
+                for digits in (1, 2, 3):
+                    with self.subTest(number=number, ceiling=ceiling, digits=digits):
+                        plan = build_candidate_plan(number, digits, ceiling)
+                        values = [int(value) for value in plan]
+                        self.assertEqual(len(values), plan.total)
+                        self.assertEqual(len(set(values)), plan.total)
+                        self.assertNotIn(int(number), values)
+                        if ceiling is not None:
+                            self.assertTrue(all(value <= ceiling for value in values))
+                        self.assertTrue(previous <= set(values))
+                        previous = set(values)
+
+    def test_the_ceiling_drops_ids_that_cannot_exist_yet(self):
+        plain = build_candidate_plan("398765432", 3)
+        capped = build_candidate_plan("398765432", 3, ceiling=414471210)
+        dropped = {int(v) for v in plain} - {int(v) for v in capped}
+        self.assertGreater(len(dropped), plain.total // 10)
+        self.assertTrue(all(value > 414471210 for value in dropped))
+        # A number longer than the ceiling has no same-length replacements left,
+        # and the iterator says so without building any of them.
+        self.assertEqual(count_digit_variations("1234567890", 2, ceiling=414471210), 0)
+        with patch.object(inat_finder.itertools, "combinations") as combinations:
+            for likely in (None, True, False):
+                self.assertEqual(
+                    list(
+                        iter_digit_variations(
+                            "1234567890", 8, ceiling=414471210, likely=likely
+                        )
+                    ),
+                    [],
+                )
+        combinations.assert_not_called()
+        # A ten-digit number with a large --digits is now a small, fast plan.
+        plan = build_candidate_plan("1234567890", 8, ceiling=414471210)
+        self.assertEqual(plan.replacement_count, 0)
+        self.assertEqual(len(list(plan)), plan.total)
+
+    def test_count_honours_the_ceiling_exactly(self):
+        for number in ("234101178", "0123", "100", "98765"):
+            for digits in (1, 2, 3):
+                for ceiling in (99, 5000, 234000000, 234101178, 10**12):
+                    with self.subTest(number=number, digits=digits, ceiling=ceiling):
+                        expected = sum(
+                            1
+                            for value in iter_digit_variations(number, digits)
+                            if int(value) <= ceiling
+                        )
+                        self.assertEqual(
+                            count_digit_variations(number, digits, ceiling=ceiling),
+                            expected,
+                        )
+
+    def test_likely_substitutions_come_first(self):
+        plan = build_candidate_plan(self.NUMBER, 3)
+        ordered = list(plan)
+        first_extra = ordered.index(plan.extras[0])
+        for candidate in ordered[:first_extra]:
+            for original, replacement in zip(self.NUMBER, candidate):
+                if original != replacement:
+                    self.assertIn(replacement, inat_finder.LIKELY_DIGITS[original])
+        # A three-digit look-alike typo is met long before an arbitrary one.
+        self.assertLess(ordered.index("284101778"), ordered.index("204101578"))
+
+    def test_restore_replays_a_capped_plan(self):
+        ceiling = 234100000
+        seen = set()
+        for index in (1, 2):
+            stage = AutoStage(index, build_candidate_plan(self.NUMBER, index, ceiling), seen)
+            for position, _candidate in enumerate(stage, start=1):
+                if index == 2 and position == 300:
+                    break
+        self.assertEqual(
+            restore_seen_ids(self.NUMBER, 2, stage.plan_position, ceiling), seen
+        )
+
+
+class TestIdCeilingLookup(unittest.TestCase):
+    def test_newest_id_plus_margin(self):
+        with patch.object(
+            inat_finder,
+            "api_get_json",
+            Mock(return_value={"results": [{"id": 414470210}]}),
+        ):
+            self.assertEqual(
+                inat_finder.fetch_id_ceiling(Mock()),
+                414470210 + inat_finder.ID_CEILING_MARGIN,
+            )
+
+    def test_a_failed_lookup_searches_everything(self):
+        messages = Mock()
+        with patch.object(
+            inat_finder, "api_get_json", Mock(side_effect=inat_finder.ApiError("down"))
+        ):
+            self.assertIsNone(inat_finder.fetch_id_ceiling(messages))
+        messages.assert_called_once()
+        with patch.object(inat_finder, "api_get_json", Mock(return_value={"results": []})):
+            self.assertIsNone(inat_finder.fetch_id_ceiling(Mock()))
+
+
+class TestAutoModeCeiling(AutoModeMixin, unittest.TestCase):
+    def test_the_ceiling_is_applied_and_carried_by_the_resume_token(self):
+        ceiling = 123456900
+        fetch, calls = self.fetcher({123456788})
+        lookup = Mock(return_value=ceiling)
+        status, output = self.run_main(
+            ["inat_finder.py", "--auto", "--genus", "Amanita", "123456789",
+             "--no-progress"],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+                "fetch_id_ceiling": lookup,
+            },
+        )
+        self.assertEqual(status, 0)
+        lookup.assert_called_once()
+        requested = self.requested_ids(calls)
+        self.assertTrue(all(int(value) <= ceiling for value in requested[1:]))
+        token = next(
+            line.split()[-1] for line in output.splitlines() if "--auto-resume" in line
+        )
+        self.assertEqual(parse_resume_token(token)[2], ceiling)
+
+        # Resuming keeps the token's ceiling and does not look it up again.
+        lookup = Mock(return_value=999999999)
+        fetch, calls = self.fetcher(set())
+        status, output = self.run_main(
+            ["inat_finder.py", "--auto", "--genus", "Amanita", "123456789",
+             "--no-progress", "--yes", "--auto-resume", token],
+            {
+                "find_taxon": Mock(return_value=GENUS_TAXON),
+                "fetch_observations": Mock(side_effect=fetch),
+                "fetch_id_ceiling": lookup,
+            },
+        )
+        lookup.assert_not_called()
+        requested = self.requested_ids(calls)
+        self.assertTrue(requested)
+        self.assertTrue(all(int(value) <= ceiling for value in requested))
+
+
+class TestTypoDistanceRanking(unittest.TestCase):
+    def test_typo_distance(self):
+        self.assertEqual(inat_finder.typo_distance("123", "123"), 0)
+        self.assertEqual(inat_finder.typo_distance("12345", "12354"), 1)  # swap
+        self.assertEqual(inat_finder.typo_distance("1234", "123"), 1)
+        self.assertEqual(inat_finder.typo_distance("234101178", "234410178"), 2)
+
+    def test_a_plausible_typo_outranks_a_numerically_closer_neighbour(self):
+        # Seen live: 284470178 is 234410178 with a 3 read as 8 and a 1 as 7, and a
+        # same-genus observation 95 IDs away also turned up in stage 1.
+        def match(obs_id):
+            return inat_finder.ScoredMatch({"id": obs_id}, ["genus"], [], 1)
+
+        ranked = rank_matches([match(284470083), match(234410178)], origin="284470178")
+        self.assertEqual([m.observation["id"] for m in ranked], [234410178, 284470083])
 
 
 if __name__ == "__main__":

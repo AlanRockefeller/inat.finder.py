@@ -32,8 +32,14 @@ A Windows .exe is available [here](https://github.com/AlanRockefeller/inat.finde
 - Generates all possible variations with a configurable number of digits that might be wrong (default: 1) - _Now more robust for multiple digits off!_
 - Supports parsing observation numbers directly from iNaturalist URLs
 - For short numbers (<9 digits), tries inserting one or two missing digits at any position, including internal positions
-- Tries swapping adjacent digits to catch transposition typos (123456789 -> 123465789)
+- Tries swapping any two digits to catch transposition typos (123456789 -> 123465789), adjacent swaps first
 - For long numbers (>5 digits), tries removing one or two digits.
+- Tries two or three digits misread as handwriting look-alikes (1/7, 4/9, 3/8, 5/6, 0/6, 2/7, 0/8), as on a foray label
+- Tries one digit dropped and another added, so the digits between slide over (234410178 typed as 234101178)
+- Tries numerically nearby IDs (+/-500), which catches the ID of a neighbouring observation from the same upload
+- With `--digits 2` or more, also tries a swap or a missing digit combined with one other wrong digit
+- Tries look-alike and next-key digits before other substitutions, so a stage that stops at its first hit meets the likeliest typos first
+- Skips IDs above the newest observation on iNaturalist, which cannot exist yet (about a fifth of a three-digit search)
 - Suggests checking Mushroom Observer for very short numbers (≤5 digits)
 - Can discover observations with missing digits from both beginning and end simultaneously
 - Efficiently queries the iNaturalist API with batched requests of 200 to minimize API calls
@@ -210,8 +216,8 @@ second clue when you can.
 | Stage | What it searches                                                                    |
 | ----- | ----------------------------------------------------------------------------------- |
 | 0     | the number exactly as supplied - it may be right, and something else wrong          |
-| 1     | one substituted digit, plus adjacent swaps, plus the missing/extra-digit heuristics |
-| 2     | two substituted digits not already tried                                            |
+| 1     | one substituted digit, plus swaps, look-alikes, shifted digits, nearby IDs, and the missing/extra-digit heuristics |
+| 2     | two substituted digits, plus a swap or missing digit combined with a wrong digit, not already tried |
 | 3     | three substituted digits not already tried                                          |
 
 `--digits N` caps the ladder (default 3). No observation ID is ever requested twice
@@ -236,13 +242,17 @@ the next stage is large enough to want confirmation - it prints a resume token:
 
 ```
 To keep searching from here, re-run with:
-  --auto-resume v1:2:200:9f3c1a4e
+  --auto-resume v2:2:200:414471210:9f3c1a4e
 ```
 
 Re-running with that token replays the already-tried candidates offline, with no
 API calls, and carries on from exactly where the previous run stopped. The token is
 bound to the observation number, the clues and the `--digits` cap, so a cursor can
-never be replayed against a search it did not come from.
+never be replayed against a search it did not come from. Copy the token your own run
+printed; the one above is only an example. The token has the form
+`v2:<stage>:<offset>:<ceiling>:<fingerprint>`, where `<ceiling>` is the highest
+observation ID the search tries (0 when the newest-ID lookup failed). Tokens from
+earlier releases (`v1:...`) are no longer accepted; start that search again instead.
 
 A search that stopped because _requests failed_ gets no token. Its failed batches
 are already marked as tried, so a cursor would skip them for good; that run exits
@@ -291,7 +301,7 @@ where a caller gets a bare exit status and nothing to show a user.
   "unusable_clues": [],
   "notices": [],
   "stages": [{ "stage": 0, "total": 1, "attempted": 1, "unchecked": 0 }],
-  "resume": { "stage": 2, "offset": 0, "token": "v1:2:0:35050284" },
+  "resume": { "stage": 2, "offset": 0, "token": "v2:2:0:414471210:35050284" },
   "message": null
 }
 ```
@@ -366,7 +376,7 @@ higher `score` when the same observation appears twice.
 4. The script checks if the original observation number already matches the specified search criterion.
 5. It counts the candidate search space - variations with between one and the specified maximum number of digits changed - before generating anything, and asks for confirmation (or refuses) if it is very large.
 6. For short numbers (<9 digits), it also inserts one or two digits at every possible position, internal positions included.
-7. For long numbers (>5 digits), it also generates variations with 1-2 digits removed. Adjacent digit swaps are added when `--digits 1` does not already cover them.
+7. For long numbers (>5 digits), it also generates variations with 1-2 digits removed. Swaps of any two digits are added when `--digits 1` does not already cover them, as are look-alike digits, shifted digits and nearby IDs beyond what the substitution search covers. One API call looks up the newest observation ID first, and candidates above it are skipped.
 8. It streams these variations, in batches of 200 IDs per request, to the iNaturalist API. Batches whose request fails are retried, and any candidates that still could not be checked are reported as an incomplete search.
 9. For each observation found, it checks if the selected genus, family, taxon ID, username, or project matches what you're looking for. Genus, family and `--taxon-id` searches all decide membership from the observation's taxonomic ancestry, never from a taxon name.
 10. It presents all matching observations, including the creator username and direct links to view them on iNaturalist.org.
@@ -386,7 +396,7 @@ For shorter numbers, additional variations are generated by adding digits at any
 - For an 8-digit number: 3,735 insertion candidates (81 of them with a single digit added)
 - For a 7-digit number: 2,997 insertion candidates (72 of them with a single digit added)
 
-Numbers longer than 5 digits also get up to 45 more candidates from removing one or two digits, plus up to 8 adjacent-digit swaps. Altogether, a 9-digit number with 1 digit off checks 133 unique IDs, and an 8-digit number with 1 digit off checks 3,849.
+Numbers longer than 5 digits also get up to 45 more candidates from removing one or two digits. Every number also gets swaps (up to 36), look-alike digits (a few hundred), shifted digits (about 550) and nearby IDs (up to 1,000). Altogether, a 9-digit number with 1 digit off checks about 1,900 unique IDs, about ten batches. Candidates above the newest observation ID are skipped, so the real count is usually a little lower.
 
 The candidate count is calculated before any candidate is built. Searches over 5,000 variations print a time estimate and ask for confirmation first; pass `--yes` to skip the prompt. Searches needing more than 1,000,000 API-checked candidates (for example `--digits 8` or `--digits 9` on a 9-digit number) are refused outright, because they could not finish in a reasonable time.
 
