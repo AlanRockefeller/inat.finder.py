@@ -2,6 +2,12 @@
 
 All notable changes to the inat.finder.py project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- A same-length typo where one digit was dropped and another added was never found by a one-digit search, and `--auto` only reached it in stage 3 (about 62,000 candidates, where it stops at the first hit). For example, 234410178 typed as 234101178 drops a "4" and doubles a "1", so every digit in between shifts over by one. Counted as substitutions, that is three wrong digits. The tool now also tries removing any one digit and inserting any digit anywhere else. For a nine-digit number this adds about 550 candidates to the first stage, which takes about 4 extra seconds. Resume tokens from earlier versions are rejected, because the order of the candidates has changed.
+
 ## [1.8.1] - 2026-09-10
 
 ### Fixed

@@ -11,7 +11,8 @@ iNaturalist database.
 
 If the observation number has fewer than 9 digits, it will also try inserting one or two missing
 digits at any position. Longer numbers are also tried with up to two digits removed, and adjacent
-digits are swapped to catch transposition typos.
+digits are swapped to catch transposition typos. Same-length numbers where one digit was dropped
+and another added (e.g. 234410178 typed as 234101178) are tried too.
 
 For very short numbers (5 digits or less), it will suggest that the number might be a
 Mushroom Observer observation number instead.
@@ -127,7 +128,7 @@ AUTO_DEFAULT_MAX_DIGITS = 3
 # Bumped whenever candidate generation changes order or content. A resume cursor
 # from an older generation would point at the wrong place, so it is part of the
 # resume fingerprint and an old token is rejected rather than silently misused.
-CANDIDATE_GENERATION_VERSION = 1
+CANDIDATE_GENERATION_VERSION = 2
 RESUME_TOKEN_VERSION = 1
 # Schema version of the --json result object.
 JSON_RESULT_VERSION = 1
@@ -814,19 +815,67 @@ def generate_digit_transpositions(number_str):
     return variations
 
 
+def _hamming_distance(a, b):
+    """Number of positions at which two equal-length strings differ."""
+    return sum(1 for x, y in zip(a, b) if x != y)
+
+
+def generate_digit_shifts(number_str, min_hamming=1):
+    """
+    Generate variations with one digit dropped and another digit added elsewhere.
+
+    This catches the common same-length typo where a digit is skipped and a
+    neighbouring one is doubled or misplaced, so everything between the two
+    positions slides over by one (234410178 typed as 234101178). As a
+    substitution it can touch many positions at once; as an edit it is just one
+    deletion plus one insertion, at most ``n * (n + 1) * 10`` candidates.
+
+    Only candidates differing from the original in more than ``min_hamming``
+    positions are kept, so a plan can exclude what its substitution search
+    already covers. Results with a leading zero are skipped.
+
+    Args:
+        number_str (str): The original observation number.
+        min_hamming (int): Skip candidates at or below this Hamming distance.
+
+    Returns:
+        List[str]: Unique numeric-ID variations of the same length.
+    """
+    seen = set()
+    variations = []
+    n = len(number_str)
+    for remove_at in range(n):
+        shorter = number_str[:remove_at] + number_str[remove_at + 1 :]
+        for insert_at in range(n):
+            for digit in "0123456789":
+                candidate = shorter[:insert_at] + digit + shorter[insert_at:]
+                if candidate == number_str or not _is_valid_candidate(candidate):
+                    continue
+                if _hamming_distance(candidate, number_str) <= min_hamming:
+                    continue
+                numeric = int(candidate)
+                if numeric in seen:
+                    continue
+                seen.add(numeric)
+                variations.append(candidate)
+    return variations
+
+
 class CandidatePlan:
     """A deduplicated search space that is sized up front and streamed on demand.
 
     Replacement variations are counted exactly with :func:`count_digit_variations`
     and generated lazily, so a huge ``--digits`` value never builds a list. The much
-    smaller insertion, removal and transposition classes are materialized once
-    (a few thousand candidates at most) so the total is exact.
+    smaller insertion, removal, transposition and shift classes are materialized
+    once (a few thousand candidates at most) so the total is exact.
 
     The candidate classes cannot collide with each other: insertions and removals
     change the number's length, and transpositions - which do not - are only added
     when ``digits_off`` is below 2, because a two-digit replacement search already
     contains every adjacent swap. That means no observation ID is ever requested
-    twice and ``total`` is the true number of API-checked candidates.
+    twice and ``total`` is the true number of API-checked candidates. Shifts (one
+    digit dropped, another added) keep the length too, so only those differing in
+    more than ``digits_off`` positions are added; the rest are replacements.
     """
 
     def __init__(self, number_str, digits_off, add_digits=True, remove_digits=True):
@@ -836,6 +885,7 @@ class CandidatePlan:
         self.additions = []
         self.removals = []
         self.transpositions = []
+        self.shifts = []
 
         if digits_off > 0:
             if add_digits:
@@ -846,11 +896,12 @@ class CandidatePlan:
                 # With --digits 2 or more every adjacent swap is already a
                 # two-digit replacement, so adding them would duplicate requests.
                 self.transpositions = generate_digit_transpositions(number_str)
+            self.shifts = generate_digit_shifts(number_str, digits_off)
 
         seen = {int(number_str)} if number_str.isdigit() and number_str else set()
         self.extras = []
         for candidate in itertools.chain(
-            self.additions, self.removals, self.transpositions
+            self.additions, self.removals, self.transpositions, self.shifts
         ):
             numeric = int(candidate)
             if numeric in seen:
@@ -884,6 +935,13 @@ class CandidatePlan:
             lines.append(
                 f"{len(self.transpositions)} variations by swapping adjacent digits"
             )
+        shift_count = len(self.shifts) - len(
+            set(self.transpositions).intersection(self.shifts)
+        )
+        if shift_count:
+            lines.append(
+                f"{shift_count} variations by dropping one digit and adding another"
+            )
         return lines
 
 
@@ -908,6 +966,8 @@ def auto_stage_label(index, plan):
     parts = [f"{ordinal} substituted {digit_word}"]
     if plan.transpositions:
         parts.append("adjacent swaps")
+    if plan.shifts:
+        parts.append("shifted digits")
     if plan.additions and plan.removals:
         parts.append("missing or extra digits")
     elif plan.additions:

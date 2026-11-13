@@ -24,6 +24,7 @@ from inat_finder import (
     count_digit_variations,
     generate_digit_additions,
     generate_digit_removals,
+    generate_digit_shifts,
     generate_digit_transpositions,
     generate_digit_variations,
     parse_inat_url,
@@ -1367,7 +1368,8 @@ class TestCandidatePlanning(unittest.TestCase):
         plan = CandidatePlan("123456789", 4, add_digits=False, remove_digits=False)
         self.assertGreater(plan.total, 800000)
         # Nothing large was built: only the bounded extra classes are stored.
-        self.assertEqual(plan.extras, [])
+        self.assertEqual(plan.extras, plan.shifts)
+        self.assertLess(len(plan.extras), 1000)
         self.assertIsInstance(iter(plan), types.GeneratorType)
         self.assertEqual(len(list(itertools.islice(plan, 5))), 5)
 
@@ -1384,6 +1386,21 @@ class TestCandidatePlanning(unittest.TestCase):
         self.assertIn("123499", variations)
         self.assertEqual(len(variations), len(set(variations)))
         self.assertTrue(all(not v.startswith("0") for v in variations))
+
+    def test_shifted_digit_typo_is_in_stage_one(self):
+        # Reported miss: 234410178 typed as 234101178 - a "4" dropped and a "1"
+        # doubled. That is three substitutions but only one shift.
+        plan = build_candidate_plan("234101178", 1)
+        self.assertIn("234410178", list(plan))
+        self.assertIn("234410178", plan.shifts)
+
+    def test_shifts_skip_what_substitutions_cover(self):
+        for digits_off in (1, 2, 3):
+            for candidate in generate_digit_shifts("234101178", digits_off):
+                self.assertEqual(len(candidate), 9)
+                differing = sum(a != b for a, b in zip(candidate, "234101178"))
+                self.assertGreater(differing, digits_off)
+        self.assertNotIn("012", generate_digit_shifts("102"))
 
     def test_adjacent_transpositions(self):
         self.assertIn("123465789", generate_digit_transpositions("123456789"))
@@ -1428,7 +1445,7 @@ class TestSearchSizeSafety(MainRunnerMixin, unittest.TestCase):
                 ),
             )
         self.assertEqual(status, 0)
-        self.assertIn("61937 total unique variations", output)
+        self.assertIn("62309 total unique variations", output)
         # The confirmation prompt is asked before any candidate is generated.
         self.assertIn("This is a large search", prompt.call_args.args[0])
         self.assertIn("Exiting search.", output)
@@ -2750,8 +2767,11 @@ class TestAutoModeLadder(AutoModeMixin, unittest.TestCase):
         self.assertIn("Observation #123456788", output)
         self.assertIn("Stage 1", output)
         self.assertNotIn("Stage 2", output)
-        # Stage 0 is one ID; stage 1 for a nine-digit number is a single batch.
-        self.assertEqual(len(calls), 2)
+        # Stage 0 is one ID, then stage 1 in full - and nothing more.
+        stage_one_batches = -(
+            -build_candidate_plan("123456789", 1).total // inat_finder.BATCH_SIZE
+        )
+        self.assertEqual(len(calls), 1 + stage_one_batches)
 
     def test_empty_stage_one_escalates_to_stage_two(self):
         # 123456700 differs from 123456789 in two digits, so only stage 2 has it.
@@ -2817,7 +2837,8 @@ class TestAutoModeLadder(AutoModeMixin, unittest.TestCase):
         stage_two_batches = (
             len(stage_two) + inat_finder.BATCH_SIZE - 1
         ) // inat_finder.BATCH_SIZE
-        self.assertEqual(len(calls), 2 + stage_two_batches)
+        stage_one_batches = -(-len(stage_one) // inat_finder.BATCH_SIZE)
+        self.assertEqual(len(calls), 1 + stage_one_batches + stage_two_batches)
         # And it still stops there rather than climbing to stage 3.
         self.assertNotIn("Stage 3", output)
 
@@ -2967,7 +2988,7 @@ class TestAutoModeLadder(AutoModeMixin, unittest.TestCase):
         self.assertIn("missing or extra digits", short)
         self.assertEqual(
             inat_finder.auto_stage_label(2, build_candidate_plan("123456789", 2)),
-            "two substituted digits and extra digits",
+            "two substituted digits, shifted digits, and extra digits",
         )
 
 
@@ -3265,7 +3286,10 @@ class TestAutoModeProjects(AutoModeMixin, unittest.TestCase):
         # One request per search batch, every one of them carrying the project
         # filter. Stage 0 is deliberately unfiltered - it asks what the supplied
         # number is, which a membership filter would refuse to answer.
-        self.assertEqual(len(calls), 2)
+        stage_one_batches = -(
+            -build_candidate_plan("123456789", 1).total // inat_finder.BATCH_SIZE
+        )
+        self.assertEqual(len(calls), 1 + stage_one_batches)
         self.assertIsNone(calls[0]["project_id"])
         self.assertEqual(calls[0]["ids"], ["123456789"])
         self.assertTrue(all(call["project_id"] == "42" for call in calls[1:]))
