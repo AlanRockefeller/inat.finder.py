@@ -2,16 +2,27 @@
 
 All notable changes to the inat.finder.py project will be documented in this file.
 
-## [Unreleased]
+## [1.8.2] - 2026-11-13
 
 ### Fixed
 
-- More of the typos that look like several wrong digits but are really one mistake are now tried in the first stage: two digits swapped even when they are not next to each other, two or three digits misread as handwriting look-alikes (1/7, 4/9, 3/8, 5/6, 0/6, 2/7, 0/8), and numerically nearby IDs within 500, which catches the ID of a neighbouring observation from the same upload. A nine-digit number's first stage grows to about 1,900 candidates, about ten seconds.
-- With `--digits 2` or more (the second `--auto` stage), a swap combined with one other wrong digit, and a missing digit combined with one other wrong digit, are tried too.
-- Within each stage, substitutions with look-alike or next-key digits are tried before the rest. A large stage that stops at its first full match is therefore more likely to stop on the right observation.
-- When several matches tie, the one that is the more plausible typo (fewest wrong, missing, extra or swapped digits) is now listed first, ahead of one that is merely numerically closer. With nearby IDs in the first stage, a neighbouring upload with the same genus would otherwise often be listed above the observation you meant.
-- The tool now looks up the newest observation on iNaturalist before it searches, and skips candidates above it, because those IDs cannot exist yet. That is about a fifth of a three-digit search. If the lookup fails, everything is checked as before. Resume tokens now carry this ceiling, so they have a new format (`v2:...`) and older tokens are rejected.
-- A same-length typo where one digit was dropped and another added was never found by a one-digit search, and `--auto` only reached it in stage 3 (about 62,000 candidates, where it stops at the first hit). For example, 234410178 typed as 234101178 drops a "4" and doubles a "1", so every digit in between shifts over by one. Counted as substitutions, that is three wrong digits. The tool now also tries removing any one digit and inserting any digit anywhere else. For a nine-digit number this adds about 550 candidates to the first stage, which takes about 4 extra seconds. Resume tokens from earlier versions are rejected, because the order of the candidates has changed.
+- Some typos that are really one mistake were never found by a normal search, because they change several digits at once. The example that showed this: 234410178 typed as 234101178. A "4" was left out and a "1" was typed twice, so every digit in between moved over by one place. That looks like three wrong digits, so a one-digit search never tried it, and `--auto` only reached it in its third stage, which has about 62,000 candidates and stops at the first hit. The tool now tries leaving out any one digit and adding any digit somewhere else, and finds this one in the first stage. Thanks to Scott Ostuni for the suggestion.
+- When several matches are equally good, the one that is the more likely typo is now listed first. "More likely" means the fewest wrong, missing, extra or swapped digits. Before, the closest number came first, which often put a neighbouring upload with the same genus above the observation you meant.
+
+### Added
+
+- The first stage also tries these common mistakes:
+  - two digits swapped, even when they are not next to each other
+  - two or three digits misread in handwriting: 1/7, 4/9, 3/8, 5/6, 0/6, 2/7 and 0/8
+  - numbers up to 500 above or below the one you typed, which catches the number of the observation next to it from the same upload
+- With `--digits 2` or more (the second `--auto` stage), the tool also tries a swap plus one wrong digit, and a missing digit plus one wrong digit.
+- Before searching, the tool asks iNaturalist for its newest observation number and skips anything above it, because those numbers cannot exist yet. That saves about a fifth of a three-digit search. If the lookup fails, everything is checked as before.
+
+### Changed
+
+- Within each stage, look-alike digits and digits from the key next door are tried before other wrong digits. A large stage that stops at its first match is more likely to stop on the right one.
+- The first stage for a nine-digit number is now about 1,800 candidates instead of 133. That is about 9 requests, or roughly 10 to 20 seconds.
+- Resume tokens now include the newest-observation limit, so they look like `v2:2:0:414471210:37985caa`. Tokens from older versions are no longer accepted; start that search again instead.
 
 ## [1.8.1] - 2026-09-10
 

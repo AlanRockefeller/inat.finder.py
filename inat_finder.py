@@ -2,7 +2,7 @@
 """
 iNaturalist Observation Finder
 
-Version 1.8.1 - By Alan Rockefeller - September 10, 2026
+Version 1.8.2 - By Alan Rockefeller - November 13, 2026
 
 This script helps find the correct iNaturalist observation number when there are mistyped digits.
 It works by systematically changing digits of the provided observation number and checking if
@@ -94,7 +94,7 @@ from email.utils import parsedate_to_datetime
 import requests
 from tqdm import tqdm
 
-VERSION = "1.8.1"
+VERSION = "1.8.2"
 API_BASE_URL = "https://api.inaturalist.org/v1"
 BATCH_SIZE = 200
 REQUEST_TIMEOUT = 20
