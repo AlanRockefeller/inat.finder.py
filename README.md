@@ -1,8 +1,8 @@
 # inat.finder.py
 
-**Version:** 1.8.1
+**Version:** 1.8.2
 **Author:** Alan Rockefeller
-**Release Date:** September 10, 2026
+**Release Date:** November 13, 2026
 
 ## Use it online - no installation required
 
